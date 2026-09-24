@@ -16,6 +16,39 @@ const path = require('path');
 function out(p, obj) { try { fs.writeFileSync(p, JSON.stringify(obj), 'utf8'); } catch (e) { } }
 function norm(s) { return String(s || '').replace(/\s+/g, ''); }
 
+// ---------- 候选是否"就是这首歌"的硬判定 ----------
+// 网易云对「没版权 / 已下架」的歌（例如罗大佑的部分作品）不会返回空，
+// 而是返回该歌手其他热门歌或同名翻唱。旧版只对歌手名不匹配扣 25 分、
+// 从不拒绝，于是会拿《东方之珠》的歌词/逐字/翻译去配《皇后大道东》。
+const CACHE_VER = 3;                       // 判定逻辑变了 -> 旧缓存作废
+function normKey(s) {
+    return String(s || '').toLowerCase()
+        .replace(/[\(\[（【][^\)\]）】]*[\)\]）】]/g, '')   // 去掉 (Live) (Remastered) 之类
+        .replace(/[\s\-–—_.,!?'"·:：;；/\\|]/g, '');
+}
+function titleMatch(a, b) {
+    const x = normKey(a), y = normKey(b);
+    if (!x || !y) return 0;
+    if (x === y) return 2;
+    if (x.length >= 3 && y.length >= 3 && (x.includes(y) || y.includes(x))) return 1;
+    return 0;
+}
+function artistMatch(a, b) {
+    const x = normKey(a), y = normKey(b);
+    if (!x || !y) return 0;
+    if (x === y) return 2;
+    if (x.includes(y) || y.includes(x)) return 1;
+    return 0;
+}
+function songOk(song, q) {
+    if (titleMatch(song.name, q.title) === 0) return false;   // 标题不像 -> 一票否决
+    if (artistMatch(((song.artists || [])[0] || {}).name, q.artist) > 0) return true;
+    // 歌手名对不上（常见"群星""DJ版"这种条目）：只有时长几乎完全一致才认
+    const want = q.duration || 0;
+    if (!want || !song.duration) return false;
+    return Math.abs(song.duration / 1000 - want) <= 3;
+}
+
 function parseLrc(lrc) {
     if (!lrc) return [];
     const rx = /^\[(\d+):(\d+(?:[.:]\d+)?)\](.*)$/;
@@ -81,43 +114,107 @@ function attachTrans(lines, transLines) {
     return info;
 }
 
-// ---------- LRCLIB ----------
-async function lrclibGet(q) {
-    try {
-        const r = await jget('https://lrclib.net/api/get?artist_name=' + encodeURIComponent(q.artist) +
-            '&track_name=' + encodeURIComponent(q.title) + '&album_name=' + encodeURIComponent(q.album || '') +
-            '&duration=' + Math.round(q.duration || 0), 12000);
-        if (r.status !== 200) return null;
-        const j = JSON.parse(r.text);
-        const lines = parseLrc(j.syncedLyrics);
-        if (!lines.length) return null;
-        return { src: 'lrclib/get', name: (j.artistName || '') + ' - ' + (j.trackName || ''), lines };
-    } catch { return null; }
+// ---------- LRCLIB（多策略级联 + 过载重试） ----------
+// 两个坑：
+//  1) LRCLIB 是社区服务，高峰期直接回 503 {"ServerOverloaded"}——旧版当成"没找到"就放弃了
+//  2) 自由文本 ?q=艺人+歌名 比结构化查询更容易空手（简繁、别名、副标题都会影响）
+// 所以按"越精确越先试"依次尝试，任何一步成功立即返回
+async function lrclibFetch(url, expectArray) {
+    for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+            const r = await jget(url, 12000, null);
+            if (r.status === 200) {
+                let j = null; try { j = JSON.parse(r.text); } catch { return null; }
+                return expectArray ? (Array.isArray(j) ? j : null) : j;
+            }
+            if (r.status === 404) return null;          // 明确不存在，重试也没用
+        } catch { }
+        await sleep(350 * (attempt + 1));               // 503 / 429 / 网络抖动 -> 退避重试
+    }
+    return null;
+}
+function lrclibItem(j, src, q) {
+    if (!j || !j.syncedLyrics) return null;
+    if (titleMatch(j.trackName, q.title) === 0) return null;   // 标题不像就别用
+    const lines = parseLrc(j.syncedLyrics);
+    if (!lines.length) return null;
+    return { src, name: (j.artistName || '') + ' - ' + (j.trackName || ''), lines };
+}
+function lrclibPick(arr, q) {
+    if (!Array.isArray(arr)) return null;
+    const cand = arr.filter((x) => {
+        if (!x || !x.syncedLyrics) return false;
+        if (titleMatch(x.trackName, q.title) === 0) return false;
+        if (artistMatch(x.artistName, q.artist) > 0) return true;
+        if (!q.duration || !x.duration) return true;          // 没时长可比时放宽，靠排序压后
+        return Math.abs(x.duration - q.duration) <= 8;        // 换歌手翻唱：时长必须接近
+    });
+    if (!cand.length) return null;
+    const rank = (x) => (artistMatch(x.artistName, q.artist) > 0 ? 0 : 1000) + Math.abs((x.duration || 0) - (q.duration || 0));
+    cand.sort((a, b) => rank(a) - rank(b));
+    return cand[0];
+}
+async function lrclib(q) {
+    const A = encodeURIComponent(q.artist || ''), T = encodeURIComponent(q.title || '');
+    const D = Math.round(q.duration || 0);
+
+    // 1) 精确匹配（带时长）：最可靠，绝大多数歌走这一步就结束
+    if (D > 0) {
+        const it = lrclibItem(await lrclibFetch('https://lrclib.net/api/get?artist_name=' + A + '&track_name=' + T + '&duration=' + D), 'lrclib/get', q);
+        if (it) return it;
+    }
+    // 2) 精确匹配（不带时长）：时长差 1~2 秒导致 /get 匹配不上时，这一步能救回来
+    {
+        const it = lrclibItem(await lrclibFetch('https://lrclib.net/api/get?artist_name=' + A + '&track_name=' + T), 'lrclib/get', q);
+        if (it) return it;
+    }
+    // 3) 结构化搜索（比自由文本稳）
+    {
+        const it = lrclibItem(lrclibPick(await lrclibFetch('https://lrclib.net/api/search?track_name=' + T + '&artist_name=' + A, true), q), 'lrclib/search', q);
+        if (it) return it;
+    }
+    // 4) 自由文本搜索
+    {
+        const it = lrclibItem(lrclibPick(await lrclibFetch('https://lrclib.net/api/search?q=' + encodeURIComponent((q.artist || '') + ' ' + (q.title || '')), true), q), 'lrclib/search', q);
+        if (it) return it;
+    }
+    // 5) 只搜歌名：简繁 / 别名差异时的兜底，仍然要求标题匹配（艺人或时长作为排序）
+    {
+        const it = lrclibItem(lrclibPick(await lrclibFetch('https://lrclib.net/api/search?q=' + T, true), q), 'lrclib/search', q);
+        if (it) return it;
+    }
+    return null;
 }
 
-async function lrclibSearch(q) {
-    try {
-        const r = await jget('https://lrclib.net/api/search?q=' + encodeURIComponent(q.artist + ' ' + q.title), 12000);
-        if (r.status !== 200) return null;
-        const arr = JSON.parse(r.text);
-        if (!Array.isArray(arr)) return null;
-        const cand = arr.filter((x) => x.syncedLyrics);
-        if (!cand.length) return null;
-        cand.sort((a, b) => Math.abs((a.duration || 0) - (q.duration || 0)) - Math.abs((b.duration || 0) - (q.duration || 0)));
-        const lines = parseLrc(cand[0].syncedLyrics);
-        if (!lines.length) return null;
-        return { src: 'lrclib/search', name: (cand[0].artistName || '') + ' - ' + (cand[0].trackName || ''), lines };
-    } catch { return null; }
+// ---------- 网易云搜索（双接口 + 频率检测） ----------
+// 坑：/api/search/get/web 被限流时返回的是 HTTP 200 + {"code":405,"msg":"操作频繁"}，
+// 只看 status 会把它当成"没有结果"，于是静默丢掉网易云这一整条来源。
+// 旧的 /api/search/get 是另一个限流桶，常常还能用，所以两个都试。
+async function neSearch(kw, h) {
+    const urls = [
+        'https://music.163.com/api/search/get/web?csrf_token=&s=' + encodeURIComponent(kw) + '&type=1&offset=0&total=true&limit=10',
+        'https://music.163.com/api/search/get?s=' + encodeURIComponent(kw) + '&type=1&offset=0&limit=10',
+    ];
+    for (const u of urls) {
+        const r = await jget(u, 12000, h).catch(() => null);
+        if (!r || r.status !== 200) continue;
+        let j = null; try { j = JSON.parse(r.text); } catch { continue; }
+        if (j.code === 405 || j.msg) continue;                 // "操作频繁，请稍候再试"
+        const list = (j.result && j.result.songs) || [];
+        if (list.length) return list;
+    }
+    return [];
 }
 
 // ---------- 网易云（候选打分 + 失败重试一次） ----------
 async function neteaseOnce(q) {
     const h = { 'Referer': 'https://music.163.com/', 'Cookie': 'appver=2.0.2' };
-    const s = await jget('https://music.163.com/api/search/get/web?csrf_token=&s=' +
-        encodeURIComponent(q.artist + ' ' + q.title) + '&type=1&offset=0&total=true&limit=10', 12000, h);
-    if (s.status !== 200) return null;
-    const songs = (JSON.parse(s.text).result || {}).songs || [];
+    const songs = await neSearch(q.artist + ' ' + q.title, h);
     if (!songs.length) return null;
+
+    // 先剔除根本不像的候选；一个都不剩就返回 null，让上游回退到 LRCLIB
+    const cands = songs.filter((song) => songOk(song, q));
+    if (!cands.length) return null;
 
     const want = q.duration || 0;
     const score = (song) => {
@@ -127,11 +224,11 @@ async function neteaseOnce(q) {
         if (norm(song.name) !== norm(q.title)) sc += 3;
         return sc;
     };
-    songs.sort((a, b) => score(a) - score(b));
+    cands.sort((a, b) => score(a) - score(b));
 
     // 依次尝试前几个候选，优先返回「带翻译」的那一个
     let fallback = null;
-    for (const song of songs.slice(0, 4)) {
+    for (const song of cands.slice(0, 4)) {
         const ly = await jget('https://music.163.com/api/song/lyric?id=' + song.id + '&lv=-1&kv=-1&tv=-1', 12000, h);
         if (ly.status !== 200) continue;
         let lj; try { lj = JSON.parse(ly.text); } catch { continue; }
@@ -175,12 +272,11 @@ function cacheSave(p, c) { try { fs.writeFileSync(p, JSON.stringify(c), 'utf8');
     const now = Math.floor(Date.now() / 1000);
 
     const hit = cache[key];
-    if (hit && hit.lines && hit.lines.length && (now - hit.ts) < (hit.ttl || 0)) {
+    if (!q.force && hit && hit.ver === CACHE_VER && hit.lines && hit.lines.length && (now - hit.ts) < (hit.ttl || 0)) {
         return out(outPath, Object.assign({}, hit, { cached: true }));
     }
 
-    let base = await lrclibGet(q);
-    if (!base) base = await lrclibSearch(q);
+    const base = await lrclib(q);
     const ne = await netease(q);
 
     let result = null, info = { pass1: 0, pass2: 0, total: 0, hit: 0 };
@@ -220,6 +316,7 @@ function cacheSave(p, c) { try { fs.writeFileSync(p, JSON.stringify(c), 'utf8');
         ttl: transCount > 0 ? 60 * 24 * 3600 : 6 * 3600,
     };
     cache[key] = {
+        ver: CACHE_VER,
         ok: true, src: payload.src, name: payload.name, transSrc: payload.transSrc,
         transCount: payload.transCount, transRate: payload.transRate,
         matchInfo: payload.matchInfo, lines: payload.lines, ts: payload.ts, ttl: payload.ttl,

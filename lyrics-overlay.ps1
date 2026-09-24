@@ -108,6 +108,21 @@ if (Test-Path $ConfigPath) {
         foreach ($k in @($CFG.Keys)) { if ($null -ne $saved.$k) { $CFG[$k] = $saved.$k } }
         if ($CFG.AnchorX -lt 0 -and $null -ne $saved.Left -and $saved.Left -ge 0) { $CFG.AnchorX = [double]$saved.Left }
         if ([int]$CFG.PollMs -lt 200) { $CFG.PollMs = 500 }     # 兼容旧配置里的小值
+
+        # ---- 迁移旧配置：字号只有「主歌词 × 比例」一套机制 ----
+        # 以前可以单独写死翻译/下一句的绝对字号（并把 FollowMain 关掉），
+        # 那种配置下拖手柄只会缩放主歌词。这里把旧的绝对字号折算成比例，观感不变。
+        $clampR = { param($r) if ($r -lt 0.25) { 0.25 } elseif ($r -gt 1.60) { 1.60 } else { $r } }
+        $fs = [double]$CFG.FontSize
+        if ($fs -gt 0) {
+            if ($null -ne $saved.TransFontSize -and -not [bool]$CFG.FollowMain) {
+                $CFG.TransRatio = & $clampR ([double]$saved.TransFontSize / $fs)
+            }
+            if ($null -ne $saved.NextFontSize -and -not [bool]$CFG.FollowMain) {
+                $CFG.NextRatio = & $clampR ([double]$saved.NextFontSize / $fs)
+            }
+        }
+        $CFG.FollowMain = $true                                 # 该开关已取消，固定为真
     } catch { }
 }
 function Save-Cfg { try { ($CFG | ConvertTo-Json) | Set-Content -LiteralPath $ConfigPath -Encoding UTF8 } catch { } }
@@ -261,6 +276,16 @@ $next    = $win.FindName('Next')
 $grip    = $win.FindName('Grip')
 $root    = $win.FindName('Root')
 
+# 设置次要行文本（翻译 / 下一句）。
+# 注意：WPF 的 TextBlock 即使 Text='' 也照样占一整行高度（实测 34px 字号仍占 46px），
+# 所以空行必须 Collapsed 折叠掉，否则只有两句歌词时下面会留一块空白，
+# 把右下角的缩放手柄推到离歌词很远的地方。
+function Set-LineText($tb, [string]$s) {
+    if ($tb.Text -ne $s) { $tb.Text = $s }
+    $v = $(if ($s) { [System.Windows.Visibility]::Visible } else { [System.Windows.Visibility]::Collapsed })
+    if ($tb.Visibility -ne $v) { $tb.Visibility = $v }
+}
+
 function Apply-Colors {
     try {
         $curFill.Foreground = Brush $CFG.TextColor
@@ -285,10 +310,10 @@ function Apply-Spacing {
 }
 function Apply-Fonts {
     try {
-        if ([bool]$CFG.FollowMain) {
-            $CFG.TransFontSize = [int][math]::Round([double]$CFG.FontSize * [double]$CFG.TransRatio)
-            $CFG.NextFontSize  = [int][math]::Round([double]$CFG.FontSize * [double]$CFG.NextRatio)
-        }
+        # 次级字号永远 = 主字号 × 比例。只有这一套机制，所以拖右下角手柄时
+        # 翻译行和下一句必然跟着一起缩放（以前单独调过次级字号会关掉跟随，就不跟了）
+        $CFG.TransFontSize = [int][math]::Round([double]$CFG.FontSize * [double]$CFG.TransRatio)
+        $CFG.NextFontSize  = [int][math]::Round([double]$CFG.FontSize * [double]$CFG.NextRatio)
         if ([int]$CFG.TransFontSize -lt 9) { $CFG.TransFontSize = 9 }
         if ([int]$CFG.NextFontSize -lt 9)  { $CFG.NextFontSize = 9 }
         $cur.FontSize = [double]$CFG.FontSize
@@ -402,14 +427,16 @@ function Start-Fetch([string]$artist, [string]$title, [string]$album, [double]$d
     $script:Lyrics = @(); $script:LyricsState = 'loading'; $script:LastIdx = -2; $script:LastPos = 0.0
     $script:HasTrans = $false; $script:KaraokeFrac = -1.0
     $cur.Text = '♪  ' + $title; $curFill.Text = $cur.Text
-    $trans.Text = ''; $next.Text = '正在获取歌词…'
+    Set-LineText $trans ''
+    Set-LineText $next '正在获取歌词…'
     $script:FailText = ''
     if (-not $NodeExe -or -not (Test-Path $FetchJs)) {
         $script:LyricsState = 'error'; $script:FailText = '缺少 node 或 lyrics-fetch.js'
         Log "fetch impossible: node='$NodeExe' js=$FetchJs"
         return
     }
-    $cached = Get-CachedLyrics $artist $title $duration
+    $cached = $null
+    if (-not [bool]$script:ForceFetch) { $cached = Get-CachedLyrics $artist $title $duration }
     if ($cached) {
         $script:Lyrics      = @($cached.lines)
         $script:LyricsState = 'ready'
@@ -418,7 +445,9 @@ function Start-Fetch([string]$artist, [string]$title, [string]$album, [double]$d
         Log ("cache hit: {0}  ({1} lines, trans {2})" -f $cached.name, @($cached.lines).Count, $cached.transCount)
         return
     }
-    $reqJson = @{ artist = $artist; title = $title; album = $album; duration = [int]$duration } | ConvertTo-Json -Compress
+    # force = 菜单里点了"重新获取歌词"：跳过缓存，逼抓取器重新去问一遍数据源
+    $reqJson = @{ artist = $artist; title = $title; album = $album; duration = [int]$duration; force = [bool]$script:ForceFetch } | ConvertTo-Json -Compress
+    $script:ForceFetch = $false
     $script:FetchStart = Get-Date
     $script:FetchJob = Start-Job -ScriptBlock $FetchScript -ArgumentList $NodeExe, $FetchJs, $ReqFile, $OutFile, $CacheFile, $reqJson
     Log ("fetch start: {0} - {1} ({2}s)" -f $artist, $title, [int]$duration)
@@ -510,7 +539,9 @@ function Poll-Smtc {
         if (($now - $script:NoSessionFrom).TotalSeconds -gt 5 -and $script:LyricsState -ne 'idle') {
             $script:Lyrics = @(); $script:LyricsState = 'idle'; $script:TrackKey = ''
             $script:LastIdx = -2; $script:LastPos = 0; $script:KaraokeFrac = -1.0
-            $cur.Text = ''; $curFill.Text = ''; $trans.Text = ''; $next.Text = ''
+            $cur.Text = ''; $curFill.Text = ''
+            Set-LineText $trans ''
+            Set-LineText $next ''
             $curFill.Visibility = [System.Windows.Visibility]::Collapsed
         }
     }
@@ -531,13 +562,14 @@ function Render-Tick {
     $st = $script:LyricsState
     if ($st -eq 'loading') { return }
     if ($st -eq 'none') {
-        if ($cur.Text -ne '（未找到歌词）') { $cur.Text = '（未找到歌词）'; $curFill.Text = ''; $trans.Text = ''; $next.Text = '' }
+        if ($cur.Text -ne '（未找到歌词）') { $cur.Text = '（未找到歌词）'; $curFill.Text = ''; Set-LineText $trans ''; Set-LineText $next '' }
         return
     }
     if ($st -eq 'error') {
         if ($cur.Text -ne '（歌词获取失败）') {
-            $cur.Text = '（歌词获取失败）'; $curFill.Text = ''; $trans.Text = ''
-            $next.Text = $(if ($script:FailText) { $script:FailText } else { '详见 lyrics-overlay.log' })
+            $cur.Text = '（歌词获取失败）'; $curFill.Text = ''
+            Set-LineText $trans ''
+            Set-LineText $next $(if ($script:FailText) { $script:FailText } else { '详见 lyrics-overlay.log' })
         }
         return
     }
@@ -580,8 +612,8 @@ function Render-Tick {
             if ($trText) { $midText = $trText; $botText = $nxText }
             else         { $midText = $nxText; $botText = '' }
         }
-        if ($trans.Text -ne $midText) { $trans.Text = $midText }
-        if ($next.Text  -ne $botText) { $next.Text  = $botText }
+        Set-LineText $trans $midText
+        Set-LineText $next  $botText
     }
 
     # KTV 填充：每帧更新（行不变也要更新，否则颜色不会推进）
@@ -643,23 +675,36 @@ function Set-SecondaryAlpha([int]$alpha) {
     }
     Apply-Colors; Save-Cfg
 }
-function New-MenuItem([string]$text, $tag, [scriptblock]$onClick) {
+function New-MenuItem([string]$text, $tag, [scriptblock]$onClick, [scriptblock]$isChecked = $null) {
     $mi = New-Object System.Windows.Forms.ToolStripMenuItem($text)
     if ($null -ne $tag) { $mi.Tag = $tag }
+    if ($null -ne $isChecked) {
+        # 开关类菜单项：显示勾选状态。没有它的话"锁定/KTV/跟随"这类开关
+        # 点完看不出当前是开还是关，只能靠猜。
+        $mi.CheckOnClick = $true
+        $mi.Checked = [bool](& $isChecked)
+        $script:CheckItems += ,@($mi, $isChecked)
+    }
     $mi.Add_Click($onClick)
     return $mi
+}
+$script:CheckItems = @()
+function Sync-MenuChecks {
+    foreach ($ci in $script:CheckItems) {
+        try { $ci[0].Checked = [bool](& $ci[1]) } catch { }
+    }
 }
 
 $menu = New-Object System.Windows.Forms.ContextMenuStrip
 
-[void]$menu.Items.Add((New-MenuItem '显示 / 隐藏' $null { if ($win.IsVisible) { $win.Hide() } else { $win.Show() } }))
+[void]$menu.Items.Add((New-MenuItem '显示歌词' $null { if ($win.IsVisible) { $win.Hide() } else { $win.Show() } } { $win.IsVisible }))
 [void]$menu.Items.Add((New-MenuItem '锁定位置（鼠标穿透）' $null {
     $CFG.Locked = -not [bool]$CFG.Locked
     Apply-Mode; Save-Cfg
     $msg = '已解锁：左键拖动移动，右键出菜单，悬停右下角手柄可改字号'
     if ([bool]$CFG.Locked) { $msg = '已锁定：鼠标穿透，不会再挡住点击' }
     try { $ni.ShowBalloonTip(2000, 'Spotify 桌面歌词', $msg, [System.Windows.Forms.ToolTipIcon]::Info) } catch { }
-}))
+} { $CFG.Locked }))
 
 [void]$menu.Items.Add('-')
 
@@ -667,7 +712,7 @@ $menu = New-Object System.Windows.Forms.ContextMenuStrip
     $CFG.Karaoke = -not [bool]$CFG.Karaoke
     $script:KaraokeFrac = -1.0
     Apply-Colors; Save-Cfg
-}))
+} { $CFG.Karaoke }))
 [void]$menu.Items.Add((New-MenuItem 'KTV 未唱部分颜色…' 'KaraokeBaseColor' { param($sender, $e) Pick-Color ([string]$sender.Tag) }))
 
 [void]$menu.Items.Add('-')
@@ -689,21 +734,27 @@ foreach ($L in @(
         param($sender, $e)
         $v = $sender.Tag
         $CFG.ShowTrans = [bool]$v.t; $CFG.ShowNextLine = [bool]$v.x
-        if (-not [bool]$CFG.ShowTrans)    { $trans.Text = '' }
-        if (-not [bool]$CFG.ShowNextLine) { $next.Text  = '' }
+        if (-not [bool]$CFG.ShowTrans)    { Set-LineText $trans '' }
+        if (-not [bool]$CFG.ShowNextLine) { Set-LineText $next  '' }
         Save-Cfg; $script:LastIdx = -2
     }))
 }
 [void]$menu.Items.Add($miLayout)
 
+function Get-Font-Info {
+    return ("主歌词 {0} 磅   翻译 {1}% = {2}   下一句 {3}% = {4}" -f [int]$CFG.FontSize,
+        [int][math]::Round([double]$CFG.TransRatio * 100), [int]$CFG.TransFontSize,
+        [int][math]::Round([double]$CFG.NextRatio * 100), [int]$CFG.NextFontSize)
+}
+
 $miFont = New-Object System.Windows.Forms.ToolStripMenuItem('字号')
 foreach ($op in @(
-    @{ n = '主歌词 增大'; f = 'main';  d = 2 },
-    @{ n = '主歌词 减小'; f = 'main';  d = -2 },
-    @{ n = '翻译 增大';   f = 'trans'; d = 1 },
-    @{ n = '翻译 减小';   f = 'trans'; d = -1 },
-    @{ n = '下一句 增大'; f = 'next';  d = 1 },
-    @{ n = '下一句 减小'; f = 'next';  d = -1 }
+    @{ n = '主歌词 增大'; f = 'main';  d =  2     },
+    @{ n = '主歌词 减小'; f = 'main';  d = -2     },
+    @{ n = '翻译 增大';   f = 'trans'; d =  0.03  },
+    @{ n = '翻译 减小';   f = 'trans'; d = -0.03  },
+    @{ n = '下一句 增大'; f = 'next';  d =  0.03  },
+    @{ n = '下一句 减小'; f = 'next';  d = -0.03  }
 )) {
     [void]$miFont.DropDownItems.Add((New-MenuItem $op.n $op {
         param($sender, $e)
@@ -712,26 +763,24 @@ foreach ($op in @(
             $v = [int]$CFG.FontSize + [int]$o.d
             if ($v -lt 10) { $v = 10 }; if ($v -gt 120) { $v = 120 }
             $CFG.FontSize = $v
+        } elseif ($o.f -eq 'trans') {
+            $r = [double]$CFG.TransRatio + [double]$o.d
+            if ($r -lt 0.25) { $r = 0.25 }; if ($r -gt 1.60) { $r = 1.60 }
+            $CFG.TransRatio = [math]::Round($r, 2)
         } else {
-            $CFG.FollowMain = $false
-            if ($o.f -eq 'trans') {
-                $v = [int]$CFG.TransFontSize + [int]$o.d
-                if ($v -lt 9) { $v = 9 }; if ($v -gt 100) { $v = 100 }
-                $CFG.TransFontSize = $v
-            } else {
-                $v = [int]$CFG.NextFontSize + [int]$o.d
-                if ($v -lt 9) { $v = 9 }; if ($v -gt 100) { $v = 100 }
-                $CFG.NextFontSize = $v
-            }
+            $r = [double]$CFG.NextRatio + [double]$o.d
+            if ($r -lt 0.25) { $r = 0.25 }; if ($r -gt 1.60) { $r = 1.60 }
+            $CFG.NextRatio = [math]::Round($r, 2)
         }
         Apply-Fonts; Save-Cfg
+        try { $ni.ShowBalloonTip(1500, '字号', (Get-Font-Info), [System.Windows.Forms.ToolTipIcon]::Info) } catch { }
     }))
 }
 [void]$miFont.DropDownItems.Add('-')
-[void]$miFont.DropDownItems.Add((New-MenuItem '跟随主歌词字号（翻译 66% / 下一句 56%）' $null {
-    $CFG.FollowMain = -not [bool]$CFG.FollowMain
-    if ([bool]$CFG.FollowMain) { Apply-Fonts }
-    Save-Cfg
+[void]$miFont.DropDownItems.Add((New-MenuItem '重置比例（翻译 66% / 下一句 56%）' $null {
+    $CFG.TransRatio = 0.66; $CFG.NextRatio = 0.56
+    Apply-Fonts; Save-Cfg
+    try { $ni.ShowBalloonTip(1500, '字号', (Get-Font-Info), [System.Windows.Forms.ToolTipIcon]::Info) } catch { }
 }))
 [void]$menu.Items.Add($miFont)
 
@@ -783,7 +832,7 @@ $miCal = New-Object System.Windows.Forms.ToolStripMenuItem('歌词校准（比�
 [void]$miCal.DropDownItems.Add((New-MenuItem '重置为 0' $null { $CFG.LyricsOffset = 0.0; Save-Cfg }))
 [void]$menu.Items.Add($miCal)
 
-[void]$menu.Items.Add((New-MenuItem '重新获取歌词' $null { $script:TrackKey = ''; $script:LastSmtc = [datetime]::MinValue }))
+[void]$menu.Items.Add((New-MenuItem '重新获取歌词（忽略缓存）' $null { $script:ForceFetch = $true; $script:TrackKey = ''; $script:LastSmtc = [datetime]::MinValue }))
 [void]$menu.Items.Add((New-MenuItem '把状态写进日志' $null {
     Log ("state: {0} | {1} | anchor={2} font={3}/{4}/{5} karaoke={6} offset={7} poll={8}ms" -f `
         $script:LyricsState, $script:LyricsSrc, $CFG.Anchor, $CFG.FontSize, $CFG.TransFontSize, $CFG.NextFontSize, [bool]$CFG.Karaoke, $CFG.LyricsOffset, $CFG.PollMs)
@@ -806,6 +855,8 @@ $miCal = New-Object System.Windows.Forms.ToolStripMenuItem('歌词校准（比�
     [System.Windows.Threading.Dispatcher]::CurrentDispatcher.InvokeShutdown()
 }))
 $ni.ContextMenuStrip = $menu
+# 每次弹出菜单前把开关的勾选状态和实际配置对齐（避免视觉状态和真实状态漂移）
+$menu.Add_Opening({ Sync-MenuChecks })
 
 function Show-MenuAtCursor {
     try {
