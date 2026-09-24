@@ -1,14 +1,12 @@
 'use strict';
-// 歌词抓取器 v3（被 lyrics-overlay.ps1 通过子进程调用）
-// 用法: node lyrics-fetch.js <请求json> <输出json> [缓存json]
-// 请求: { artist, title, album, duration }
-// 输出: { ok, src, name, lines: [{ t, s, tr }], transCount, transRate, matchInfo, cached }
-//
-// v3 改进：
-//  1) 网易云候选按「时长最接近 + 歌手名匹配」挑，避免搜到 live/翻唱版
-//  2) 翻译配对两轮：严格 ±0.8s -> 单调顺序 ±3.5s（两来源时间戳常差 1~2 秒）
-//  3) 本地缓存：命中的曲子直接返回，避免反复请求导致网易云限流（"翻译时有时无"的主因）
-//     有翻译的结果缓存 60 天；没翻译的结果只缓存 6 小时（以便稍后重试）
+// 歌词抓取器 v4：LRCLIB 五段式级联 + 网易云 yrc 逐字时间轴
+// 用法: node lyrics-fetch-yrc.js <请求json> <输出json> [缓存json]
+// 与 v3 的区别：
+//   1) 网易云 lyric 接口加 &yv=-1，取 yrc（逐字）与 ytlrc（逐字翻译）
+//   2) 有 yrc 时，直接把网易云的 yrc 行当作主歌词（它自带每行的逐字时间轴）
+//      没有 yrc 时，行为与 v3 完全一致（LRCLIB 为主 + 网易云只供翻译）
+//   3) 输出的每一行多一个 w 字段：[[起始ms, 时长ms, 文本], ...]（绝对毫秒）
+//   4) 输出每行可带词级时间轴 w，供 KTV 按字填充
 
 const fs = require('fs');
 const path = require('path');
@@ -19,7 +17,7 @@ function norm(s) { return String(s || '').replace(/\s+/g, ''); }
 // ---------- 候选是否"就是这首歌"的硬判定 ----------
 // 网易云对「没版权 / 已下架」的歌（例如罗大佑的部分作品）不会返回空，
 // 而是返回该歌手其他热门歌或同名翻唱。旧版只对歌手名不匹配扣 25 分、
-// 从不拒绝，于是会拿《东方之珠》的歌词/逐字/翻译去配《皇后大道东》。
+// 从不拒绝，于是会拿《东方之珠》的逐字/歌词去配《皇后大道东》。
 const CACHE_VER = 3;                       // 判定逻辑变了 -> 旧缓存作废
 function normKey(s) {
     return String(s || '').toLowerCase()
@@ -43,7 +41,6 @@ function artistMatch(a, b) {
 function songOk(song, q) {
     if (titleMatch(song.name, q.title) === 0) return false;   // 标题不像 -> 一票否决
     if (artistMatch(((song.artists || [])[0] || {}).name, q.artist) > 0) return true;
-    // 歌手名对不上（常见"群星""DJ版"这种条目）：只有时长几乎完全一致才认
     const want = q.duration || 0;
     if (!want || !song.duration) return false;
     return Math.abs(song.duration / 1000 - want) <= 3;
@@ -64,6 +61,43 @@ function parseLrc(lrc) {
     return lines;
 }
 
+// ---------- yrc 解析 ----------
+// 格式: [行起始ms,行时长ms](词起始ms,词时长ms,flag)词文本(...)词文本
+// 括号里是绝对毫秒
+function parseYrc(text) {
+    if (!text) return [];
+    const lines = [];
+    for (const raw of String(text).split(/\r?\n/)) {
+        const line = raw.trim();
+        if (!line) continue;
+        const m = /^\[(\d+),(\d+)\](.*)$/.exec(line);
+        if (!m) continue;
+        const t = parseInt(m[1], 10) / 1000;
+        const durMs = parseInt(m[2], 10);
+        const rest = m[3];
+        const words = [];
+        const rx = /\((\d+),(\d+),(\d+)\)/g;
+        let mm, prev = null, prevEnd = 0;
+        while ((mm = rx.exec(rest)) !== null) {
+            if (prev) {
+                const txt = rest.slice(prevEnd, mm.index);
+                if (txt) words.push([prev[0], prev[1], txt]);
+            }
+            prev = [parseInt(mm[1], 10), parseInt(mm[2], 10)];
+            prevEnd = rx.lastIndex;
+        }
+        if (prev) {
+            const tail = rest.slice(prevEnd);
+            if (tail) words.push([prev[0], prev[1], tail]);
+        }
+        const s = words.map((w) => w[2]).join('').trim();
+        if (!s) continue;
+        lines.push({ t, s, d: durMs, w: words });
+    }
+    lines.sort((a, b) => a.t - b.t);
+    return lines;
+}
+
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -76,14 +110,14 @@ async function jget(url, ms, headers) {
     return { status: r.status, text };
 }
 
-// ---------- 翻译配对（两轮） ----------
+// ---------- 翻译配对（与 v3 相同的两轮策略） ----------
 function attachTrans(lines, transLines) {
     const info = { pass1: 0, pass2: 0, total: 0 };
     if (!lines || !lines.length || !transLines || !transLines.length) return info;
     const used = new Array(transLines.length).fill(false);
     const ok = (ln, tr) => tr && norm(tr.s) && norm(tr.s) !== norm(ln.s);
 
-    for (const ln of lines) {                       // 第一轮：严格 ±0.8s
+    for (const ln of lines) {
         let best = -1, bestD = 1e9;
         for (let i = 0; i < transLines.length; i++) {
             if (used[i]) continue;
@@ -95,7 +129,7 @@ function attachTrans(lines, transLines) {
         }
     }
     let j = 0;
-    for (const ln of lines) {                       // 第二轮：单调顺序 ±3.5s
+    for (const ln of lines) {
         if (ln.tr) continue;
         while (j < transLines.length && transLines[j].t < ln.t - 3.5) j++;
         let k = j;
@@ -127,15 +161,15 @@ async function lrclibFetch(url, expectArray) {
                 let j = null; try { j = JSON.parse(r.text); } catch { return null; }
                 return expectArray ? (Array.isArray(j) ? j : null) : j;
             }
-            if (r.status === 404) return null;          // 明确不存在，重试也没用
+            if (r.status === 404) return null;
         } catch { }
-        await sleep(350 * (attempt + 1));               // 503 / 429 / 网络抖动 -> 退避重试
+        await sleep(350 * (attempt + 1));
     }
     return null;
 }
 function lrclibItem(j, src, q) {
     if (!j || !j.syncedLyrics) return null;
-    if (titleMatch(j.trackName, q.title) === 0) return null;   // 标题不像就别用
+    if (titleMatch(j.trackName, q.title) === 0) return null;
     const lines = parseLrc(j.syncedLyrics);
     if (!lines.length) return null;
     return { src, name: (j.artistName || '') + ' - ' + (j.trackName || ''), lines };
@@ -146,8 +180,8 @@ function lrclibPick(arr, q) {
         if (!x || !x.syncedLyrics) return false;
         if (titleMatch(x.trackName, q.title) === 0) return false;
         if (artistMatch(x.artistName, q.artist) > 0) return true;
-        if (!q.duration || !x.duration) return true;          // 没时长可比时放宽，靠排序压后
-        return Math.abs(x.duration - q.duration) <= 8;        // 换歌手翻唱：时长必须接近
+        if (!q.duration || !x.duration) return true;
+        return Math.abs(x.duration - q.duration) <= 8;
     });
     if (!cand.length) return null;
     const rank = (x) => (artistMatch(x.artistName, q.artist) > 0 ? 0 : 1000) + Math.abs((x.duration || 0) - (q.duration || 0));
@@ -158,27 +192,22 @@ async function lrclib(q) {
     const A = encodeURIComponent(q.artist || ''), T = encodeURIComponent(q.title || '');
     const D = Math.round(q.duration || 0);
 
-    // 1) 精确匹配（带时长）：最可靠，绝大多数歌走这一步就结束
     if (D > 0) {
         const it = lrclibItem(await lrclibFetch('https://lrclib.net/api/get?artist_name=' + A + '&track_name=' + T + '&duration=' + D), 'lrclib/get', q);
         if (it) return it;
     }
-    // 2) 精确匹配（不带时长）：时长差 1~2 秒导致 /get 匹配不上时，这一步能救回来
     {
         const it = lrclibItem(await lrclibFetch('https://lrclib.net/api/get?artist_name=' + A + '&track_name=' + T), 'lrclib/get', q);
         if (it) return it;
     }
-    // 3) 结构化搜索（比自由文本稳）
     {
         const it = lrclibItem(lrclibPick(await lrclibFetch('https://lrclib.net/api/search?track_name=' + T + '&artist_name=' + A, true), q), 'lrclib/search', q);
         if (it) return it;
     }
-    // 4) 自由文本搜索
     {
         const it = lrclibItem(lrclibPick(await lrclibFetch('https://lrclib.net/api/search?q=' + encodeURIComponent((q.artist || '') + ' ' + (q.title || '')), true), q), 'lrclib/search', q);
         if (it) return it;
     }
-    // 5) 只搜歌名：简繁 / 别名差异时的兜底，仍然要求标题匹配（艺人或时长作为排序）
     {
         const it = lrclibItem(lrclibPick(await lrclibFetch('https://lrclib.net/api/search?q=' + T, true), q), 'lrclib/search', q);
         if (it) return it;
@@ -186,10 +215,11 @@ async function lrclib(q) {
     return null;
 }
 
+// ---------- 网易云（带 yv=-1 取逐字，候选打分同 v3） ----------
 // ---------- 网易云搜索（双接口 + 频率检测） ----------
 // 坑：/api/search/get/web 被限流时返回的是 HTTP 200 + {"code":405,"msg":"操作频繁"}，
-// 只看 status 会把它当成"没有结果"，于是静默丢掉网易云这一整条来源。
-// 旧的 /api/search/get 是另一个限流桶，常常还能用，所以两个都试。
+// 只看 status 会把它当成"没有结果"，于是静默丢掉网易云这一整条来源，
+// 表现就是"逐字歌词时有时无"。旧的 /api/search/get 是另一个限流桶，常常还能用。
 async function neSearch(kw, h) {
     const urls = [
         'https://music.163.com/api/search/get/web?csrf_token=&s=' + encodeURIComponent(kw) + '&type=1&offset=0&total=true&limit=10',
@@ -206,7 +236,6 @@ async function neSearch(kw, h) {
     return [];
 }
 
-// ---------- 网易云（候选打分 + 失败重试一次） ----------
 async function neteaseOnce(q) {
     const h = { 'Referer': 'https://music.163.com/', 'Cookie': 'appver=2.0.2' };
     const songs = await neSearch(q.artist + ' ' + q.title, h);
@@ -226,27 +255,47 @@ async function neteaseOnce(q) {
     };
     cands.sort((a, b) => score(a) - score(b));
 
-    // 依次尝试前几个候选，优先返回「带翻译」的那一个
-    let fallback = null;
-    for (const song of cands.slice(0, 4)) {
-        const ly = await jget('https://music.163.com/api/song/lyric?id=' + song.id + '&lv=-1&kv=-1&tv=-1', 12000, h);
+    // 在合格候选里挑最优：优先「有逐字 + 有翻译」，同级再比时长接近度。
+    // （旧版是"谁先带翻译就用谁"，可能在拿到逐字之前就定下来了）
+    let best = null;
+    for (const song of cands.slice(0, 5)) {
+        const ly = await jget('https://music.163.com/api/song/lyric?id=' + song.id + '&lv=-1&kv=-1&tv=-1&yv=-1', 12000, h);
         if (ly.status !== 200) continue;
         let lj; try { lj = JSON.parse(ly.text); } catch { continue; }
-        const lines = parseLrc(lj.lrc && lj.lrc.lyric);
-        if (!lines.length) continue;
-        const trans = parseLrc(lj.tlyric && lj.tlyric.lyric);
         const artist = ((song.artists || [])[0] || {}).name || '';
+
+        const yrcLines = parseYrc(lj.yrc && lj.yrc.lyric);
+        const lrcLines = parseLrc(lj.lrc && lj.lrc.lyric);
+        if (!yrcLines.length && !lrcLines.length) continue;
+
+        // 翻译：优先 tlyric，没有就用 ytlrc（网易云的逐字翻译，实际是行级的）
+        let trans = parseLrc(lj.tlyric && lj.tlyric.lyric);
+        let transKind = 'tlyric';
+        if (!trans.length) { trans = parseLrc(lj.ytlrc && lj.ytlrc.lyric); transKind = trans.length ? 'ytlrc' : 'none'; }
+
+        const hasWords = yrcLines.length > 0;
+        const lines = hasWords ? yrcLines : lrcLines;
         const info = trans.length ? attachTrans(lines, trans) : { pass1: 0, pass2: 0, total: 0, hit: 0 };
-        const item = { src: 'netease', name: artist + ' - ' + song.name, duration: song.duration ? song.duration / 1000 : 0, lines, trans, transInfo: info };
-        if (info.hit > 0) return item;          // 找到带翻译的，直接用
-        if (!fallback) fallback = item;         // 记下第一个可用的作为兜底
+        // 逐字行数（真正带词时间轴的）
+        const wordLines = lines.filter((l) => l.w && l.w.length > 1).length;
+
+        const item = {
+            src: hasWords ? 'netease/yrc' : 'netease',
+            name: artist + ' - ' + song.name,
+            duration: song.duration ? song.duration / 1000 : 0,
+            lines, trans, transInfo: info, transKind, hasWords, wordLines,
+        };
+        const dd = (want && song.duration) ? Math.abs(song.duration / 1000 - want) : 999;
+        const rank = (hasWords ? 2 : 0) + (info.hit > 0 ? 1 : 0);
+        if (!best || rank > best.rank || (rank === best.rank && dd < best.dd)) best = { item, rank, dd };
+        if (rank === 3 && dd <= 3) break;               // 已经完美，不必再请求
     }
-    return fallback;
+    return best ? best.item : null;
 }
 
 async function netease(q) {
     let r = null;
-    for (let i = 0; i < 2 && !r; i++) {         // 失败重试一次（限流常是瞬时的）
+    for (let i = 0; i < 2 && !r; i++) {
         try { r = await neteaseOnce(q); } catch { r = null; }
         if (!r) await sleep(700);
     }
@@ -279,12 +328,17 @@ function cacheSave(p, c) { try { fs.writeFileSync(p, JSON.stringify(c), 'utf8');
     const base = await lrclib(q);
     const ne = await netease(q);
 
-    let result = null, info = { pass1: 0, pass2: 0, total: 0, hit: 0 };
-    if (base) {
-        result = base;
+    let result = null, info = { pass1: 0, pass2: 0, total: 0, hit: 0 }, transSrc = '';
+    if (ne && ne.hasWords) {
+        // 有逐字时间轴 -> 用网易云的行当主歌词（翻译已在 neteaseOnce 里配好）
+        result = { src: ne.src, name: ne.name, lines: ne.lines };
+        info = ne.transInfo || info;
+        transSrc = ne.name + ' (' + ne.transKind + ')';
+    } else if (base) {
+        result = { src: base.src, name: base.name, lines: base.lines };
         if (ne && ne.trans && ne.trans.length) {
             info = attachTrans(base.lines, ne.trans);
-            result.transSrc = ne.name;
+            transSrc = ne.name;
         }
     } else if (ne && ne.lines && ne.lines.length) {
         result = { src: ne.src, name: ne.name, lines: ne.lines };
@@ -293,33 +347,41 @@ function cacheSave(p, c) { try { fs.writeFileSync(p, JSON.stringify(c), 'utf8');
 
     if (!result || !result.lines.length) return out(outPath, { ok: false, err: 'no lyrics found' });
 
-    // 有翻译但配对率过低 -> 丢弃翻译（宁缺勿错）。阈值放宽到 20%：
-    // 两轮配对后仍然很低，通常说明这首本来就几乎没翻译行，而不是错位。
     if (info.hit > 0 && info.total < 0.20) {
         for (const ln of result.lines) delete ln.tr;
         info.dropped = true;
     }
 
     const transCount = result.lines.filter((l) => l.tr).length;
+    const wordLines = result.lines.filter((l) => l.w && l.w.length > 1).length;
+    const wordChars = result.lines.reduce((n, l) => n + ((l.w && l.w.length > 1) ? l.s.length : 0), 0);
+    const allChars = result.lines.reduce((n, l) => n + l.s.length, 0);
+
     const payload = {
         ok: true,
         src: result.src,
         name: result.name,
-        transSrc: result.transSrc || '',
+        transSrc,
         transCount,
-        transRate: transCount / result.lines.length,
+        transRate: result.lines.length ? transCount / result.lines.length : 0,
         matchInfo: info,
         lines: result.lines,
+        // 逐字诊断
+        hasWords: wordLines > 0,
+        wordLines,
+        wordRate: result.lines.length ? wordLines / result.lines.length : 0,
+        charRate: allChars ? wordChars / allChars : 0,
         cached: false,
         ts: now,
-        // 有翻译缓存 60 天；没有就只缓存 6 小时，方便稍后重试（网易云限流是瞬时的）
-        ttl: transCount > 0 ? 60 * 24 * 3600 : 6 * 3600,
+        // 有翻译 -> 60 天；有逐字时间轴 -> 也缓存 60 天（数据已经够好，反复去问网易云会被限流）
+        ttl: (transCount > 0 || wordLines > 0) ? 60 * 24 * 3600 : 6 * 3600,
     };
     cache[key] = {
         ver: CACHE_VER,
         ok: true, src: payload.src, name: payload.name, transSrc: payload.transSrc,
-        transCount: payload.transCount, transRate: payload.transRate,
-        matchInfo: payload.matchInfo, lines: payload.lines, ts: payload.ts, ttl: payload.ttl,
+        transCount: payload.transCount, transRate: payload.transRate, matchInfo: payload.matchInfo,
+        hasWords: payload.hasWords, wordLines: payload.wordLines, wordRate: payload.wordRate, charRate: payload.charRate,
+        lines: payload.lines, ts: payload.ts, ttl: payload.ttl,
     };
     cacheSave(cachePath, cache);
     out(outPath, payload);

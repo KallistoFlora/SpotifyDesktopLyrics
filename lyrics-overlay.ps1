@@ -150,8 +150,12 @@ Add-Type -AssemblyName System.Runtime.WindowsRuntime
 $asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
     $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and
     $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' })[0]
+$script:AwaitMethods = @{}
 function Await($op, $type) {
-    $m = $asTaskGeneric.MakeGenericMethod($type)
+    # 反射构造泛型方法是每个轮询周期最贵的固定开销，按类型缓存下来只做一次
+    $k = $type.FullName
+    $m = $script:AwaitMethods[$k]
+    if (-not $m) { $m = $asTaskGeneric.MakeGenericMethod($type); $script:AwaitMethods[$k] = $m }
     $t = $m.Invoke($null, @($op)); $t.Wait(-1) | Out-Null; $t.Result
 }
 $MgrType   = [Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager, Windows.Media.Control, ContentType=WindowsRuntime]
@@ -160,7 +164,12 @@ $script:SmtcMgr = Await ($MgrType::RequestAsync()) $MgrType
 
 function Get-NowPlaying {
     try {
-        $s = $script:SmtcMgr.GetSessions() | Where-Object { $_.SourceAppUserModelId -like '*Spotify*' } | Select-Object -First 1
+        # 用 foreach 而不是 Where-Object | Select-Object：管道在 PowerShell 里开销明显，
+        # 而这个函数每个轮询周期都要跑一次
+        $s = $null
+        foreach ($sess in $script:SmtcMgr.GetSessions()) {
+            if ($sess.SourceAppUserModelId -like '*Spotify*') { $s = $sess; break }
+        }
         if (-not $s) { return $null }
         $p  = Await ($s.TryGetMediaPropertiesAsync()) $PropsType
         $tl = $s.GetTimelineProperties()
@@ -179,24 +188,30 @@ function Get-NowPlaying {
 }
 
 # ---------- 歌词抓取 ----------
-$FetchScript = {
-    param($nodeExe, $jsFile, $reqFile, $outFile, $cacheFile, $reqJson)
-    try {
-        [System.IO.File]::WriteAllText($reqFile, $reqJson, (New-Object System.Text.UTF8Encoding($false)))
-        if (Test-Path $outFile) { Remove-Item $outFile -Force -ErrorAction SilentlyContinue }
-        & $nodeExe $jsFile $reqFile $outFile $cacheFile 2>&1 | Out-Null
-        if (Test-Path $outFile) { return [System.IO.File]::ReadAllText($outFile, [System.Text.Encoding]::UTF8) }
-        return '{"ok":false,"err":"node wrote no output"}'
-    } catch {
-        return ('{"ok":false,"err":"' + ($_.Exception.Message -replace '"', "'") + '"}')
-    }
+# 直接跑 node 进程，不再用 Start-Job。
+
+# 直接跑 node 进程，不再用 Start-Job。
+# Start-Job 每次抓取都会额外起一个完整的 PowerShell 子进程（实测几十 MB + 几百毫秒启动），
+# 而我们只需要 node 跑完、结果落在 OutFile 里 —— 那个中间进程纯属浪费。
+function Start-NodeProcess([string]$nodeExe, [string]$jsFile, [string]$reqFile, [string]$outFile, [string]$cacheFile) {
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName        = $nodeExe
+    $psi.Arguments       = '"' + $jsFile + '" "' + $reqFile + '" "' + $outFile + '" "' + $cacheFile + '"'
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow  = $true
+    $psi.WindowStyle     = [System.Diagnostics.ProcessWindowStyle]::Hidden
+    return [System.Diagnostics.Process]::Start($psi)
 }
 
 function Get-CachedLyrics([string]$artist, [string]$title, [double]$duration) {
     try {
         if (-not (Test-Path $CacheFile)) { return $null }
         $key = ((($artist -replace '\s', '') + '|' + ($title -replace '\s', '') + '|' + [int][math]::Round($duration))).ToLower()
-        $cache = Get-Content $CacheFile -Raw -Encoding UTF8 | ConvertFrom-Json
+        $raw = Get-Content $CacheFile -Raw -Encoding UTF8
+        # 先用一次字符串包含判断挡掉"缓存里压根没这首歌"（换歌时最常见）：
+        # 缓存涨到 150KB+ 后 ConvertFrom-Json 要 30ms 以上，而字符串匹配只要 0.25ms
+        if ($raw.IndexOf($key, [System.StringComparison]::OrdinalIgnoreCase) -lt 0) { return $null }
+        $cache = $raw | ConvertFrom-Json
         $prop  = $cache.PSObject.Properties | Where-Object { $_.Name -eq $key } | Select-Object -First 1
         if (-not $prop) { return $null }
         $e = $prop.Value
@@ -284,6 +299,20 @@ function Set-LineText($tb, [string]$s) {
     if ($tb.Text -ne $s) { $tb.Text = $s }
     $v = $(if ($s) { [System.Windows.Visibility]::Visible } else { [System.Windows.Visibility]::Collapsed })
     if ($tb.Visibility -ne $v) { $tb.Visibility = $v }
+}
+
+function Apply-Shadow {
+    try {
+        $eff = $null
+        if ([bool]$CFG.Shadow) {
+            $eff = New-Object System.Windows.Media.Effects.DropShadowEffect
+            $eff.Color       = [System.Windows.Media.Colors]::Black
+            $eff.BlurRadius  = 10
+            $eff.ShadowDepth = 0
+            $eff.Opacity     = 0.95
+        }
+        foreach ($tb in @($cur, $curFill, $trans, $next)) { $tb.Effect = $eff }
+    } catch { Log ("apply-shadow error: " + $_.Exception.Message) }
 }
 
 function Apply-Colors {
@@ -395,6 +424,7 @@ Reposition
 Apply-Mode
 Apply-Fonts
 Apply-Colors
+Apply-Shadow
 Apply-Align
 
 # ---------- 状态 ----------
@@ -408,7 +438,7 @@ $script:PosBias       = 0.0      # 与 SMTC 的平滑修正量
 $script:Clock         = [System.Diagnostics.Stopwatch]::StartNew()   # 单调高精度时钟
 $script:LastFrame     = 0.0
 $script:LastSmtc      = [datetime]::MinValue
-$script:FetchJob      = $null
+$script:FetchProc      = $null
 $script:FetchStart    = Get-Date
 $script:LastIdx       = -2
 $script:Playing       = $false
@@ -419,10 +449,10 @@ $script:FailText      = ''
 $script:KaraokeFrac   = -1.0
 
 function Start-Fetch([string]$artist, [string]$title, [string]$album, [double]$duration) {
-    if ($script:FetchJob) {
-        Stop-Job $script:FetchJob -ErrorAction SilentlyContinue
-        Remove-Job $script:FetchJob -Force -ErrorAction SilentlyContinue
-        $script:FetchJob = $null
+    if ($script:FetchProc) {
+        try { if (-not $script:FetchProc.HasExited) { $script:FetchProc.Kill() } } catch { }
+        try { $script:FetchProc.Dispose() } catch { }
+        $script:FetchProc = $null
     }
     $script:Lyrics = @(); $script:LyricsState = 'loading'; $script:LastIdx = -2; $script:LastPos = 0.0
     $script:HasTrans = $false; $script:KaraokeFrac = -1.0
@@ -448,55 +478,67 @@ function Start-Fetch([string]$artist, [string]$title, [string]$album, [double]$d
     # force = 菜单里点了"重新获取歌词"：跳过缓存，逼抓取器重新去问一遍数据源
     $reqJson = @{ artist = $artist; title = $title; album = $album; duration = [int]$duration; force = [bool]$script:ForceFetch } | ConvertTo-Json -Compress
     $script:ForceFetch = $false
-    $script:FetchStart = Get-Date
-    $script:FetchJob = Start-Job -ScriptBlock $FetchScript -ArgumentList $NodeExe, $FetchJs, $ReqFile, $OutFile, $CacheFile, $reqJson
+    try {
+        [System.IO.File]::WriteAllText($ReqFile, $reqJson, (New-Object System.Text.UTF8Encoding($false)))
+        if (Test-Path $OutFile) { Remove-Item $OutFile -Force -ErrorAction SilentlyContinue }
+        $script:FetchStart = Get-Date
+        $script:FetchProc  = Start-NodeProcess $NodeExe $FetchJs $ReqFile $OutFile $CacheFile
+    } catch {
+        $script:FetchProc   = $null
+        $script:LyricsState = 'error'
+        $script:FailText    = 'node 启动失败'
+        Log ("fetch spawn error: " + $_.Exception.Message)
+        return
+    }
     Log ("fetch start: {0} - {1} ({2}s)" -f $artist, $title, [int]$duration)
 }
 
 function Complete-Fetch {
-    if (-not $script:FetchJob) { return }
-    $st      = $script:FetchJob.State
+    if (-not $script:FetchProc) { return }
     $elapsed = ((Get-Date) - $script:FetchStart).TotalSeconds
 
-    if ($st -eq 'Completed') {
-        $txt = Receive-Job $script:FetchJob
-        Remove-Job $script:FetchJob -Force -ErrorAction SilentlyContinue
-        $script:FetchJob = $null
-        $res = $null
-        try { $res = ($txt | Out-String).Trim() | ConvertFrom-Json }
-        catch { Log ("fetch json parse error: " + $_.Exception.Message) }
-        if ($res -and $res.ok -and @($res.lines).Count -gt 0) {
-            $script:Lyrics      = @($res.lines)
-            $script:LyricsState = 'ready'
-            $script:HasTrans    = ([int]$res.transCount -gt 0)
-            $script:LyricsSrc   = "$($res.src) · $($res.name)"
-            if ($script:HasTrans) { $script:LyricsSrc += "  +翻译 $($res.transCount) 行" }
-            Log ("fetch ok: {0} lines, trans {1} via {2} ({3})" -f $script:Lyrics.Count, $res.transCount, $res.src, $res.name)
-        } else {
-            $script:LyricsState = 'none'; $script:HasTrans = $false
-            $errText = 'unparsable result'
-            if ($res -and $res.err) { $errText = [string]$res.err }
-            $script:FailText = $errText
-            Log ("fetch none: " + $errText)
+    if (-not $script:FetchProc.HasExited) {
+        if ($elapsed -gt 40) {
+            try { $script:FetchProc.Kill() } catch { }
+            try { $script:FetchProc.Dispose() } catch { }
+            $script:FetchProc = $null; $script:LyricsState = 'error'
+            Log ("fetch timeout after {0:N0}s" -f $elapsed)
         }
         return
     }
 
-    if ($st -eq 'Failed' -or $st -eq 'Stopped' -or $st -eq 'Blocked') {
-        $err = ''
-        try { $err = (Receive-Job $script:FetchJob -ErrorAction SilentlyContinue 2>&1 | Out-String).Trim() } catch { }
-        Remove-Job $script:FetchJob -Force -ErrorAction SilentlyContinue
-        $script:FetchJob = $null; $script:LyricsState = 'error'
-        if ($err.Length -gt 400) { $err = $err.Substring(0, 400) }
-        Log ("fetch job {0} after {1:N0}s : {2}" -f $st, $elapsed, $err)
-        return
-    }
+    $code = -1
+    try { $code = $script:FetchProc.ExitCode } catch { }
+    try { $script:FetchProc.Dispose() } catch { }
+    $script:FetchProc = $null
 
-    if ($elapsed -gt 40) {
-        Stop-Job $script:FetchJob -ErrorAction SilentlyContinue
-        Remove-Job $script:FetchJob -Force -ErrorAction SilentlyContinue
-        $script:FetchJob = $null; $script:LyricsState = 'error'
-        Log ("fetch timeout after {0:N0}s" -f $elapsed)
+    $res = $null
+    try {
+        if (Test-Path $OutFile) {
+            $txt = [System.IO.File]::ReadAllText($OutFile, [System.Text.Encoding]::UTF8)
+            if ($txt -and $txt.Trim()) { $res = $txt.Trim() | ConvertFrom-Json }
+        }
+    } catch { Log ("fetch json parse error: " + $_.Exception.Message) }
+
+    if ($res -and $res.ok -and @($res.lines).Count -gt 0) {
+        $script:Lyrics      = @($res.lines)
+        $script:LyricsState = 'ready'
+        $script:HasTrans    = ([int]$res.transCount -gt 0)
+        $script:LyricsSrc   = "$($res.src) · $($res.name)"
+        if ($script:HasTrans) { $script:LyricsSrc += "  +翻译 $($res.transCount) 行" }
+        if ([int]$res.wordLines -gt 0) { $script:LyricsSrc += "  +逐字 $($res.wordLines) 行" }
+        Log ("fetch ok: {0} lines, trans {1}, words {2} via {3} ({4})" -f $script:Lyrics.Count, $res.transCount, $res.wordLines, $res.src, $res.name)
+        if ($ni) {
+            if ([int]$res.wordLines -gt 0) { $ni.Text = "Spotify 桌面歌词 · 逐字 $($res.wordLines)/$($script:Lyrics.Count) 行" }
+            else { $ni.Text = 'Spotify 桌面歌词 · 这首无逐字数据' }
+        }
+    } else {
+        $script:LyricsState = 'none'; $script:HasTrans = $false
+        $errText = 'unparsable result'
+        if ($res -and $res.err) { $errText = [string]$res.err }
+        elseif ($code -ne 0) { $errText = "取值进程异常退出 (exit $code)" }
+        $script:FailText = $errText
+        Log ("fetch none after {0:N0}s: {1}" -f $elapsed, $errText)
     }
 }
 
@@ -632,14 +674,73 @@ function Render-Tick {
     $dur = $end - $start
     if ($dur -le 0.2) { $dur = 0.2 }
     if ($dur -gt 8) { $dur = 8 }          # 长间奏时 8 秒内填满，不要慢吞吞爬
-    $frac = ($effPos - $start) / $dur
-    if ($frac -lt 0) { $frac = 0 }
-    if ($frac -gt 1) { $frac = 1 }
+    # 【逐字】有逐字时间轴就按字推进，没有则回退到行级线性
+    $frac = Get-KtvFraction $script:Lyrics[$idx] $effPos $start $dur
     if ([math]::Abs($frac - $script:KaraokeFrac) -lt 0.0015) { return }   # 变化太小就不重绘
     $script:KaraokeFrac = $frac
     $w = $curFill.ActualWidth
     if ($w -le 0) { return }
-    $curClip.Rect = New-Object System.Windows.Rect(0, 0, ($w * $frac), $curFill.ActualHeight)
+    # 用 [Rect]::new 而不是 New-Object：结构体走 New-Object 要走反射，
+    # 实测 0.098ms/次 vs 0.0016ms/次（60fps 每秒 60 次，差 6ms/秒）
+    $curClip.Rect = [System.Windows.Rect]::new(0, 0, ($w * $frac), $curFill.ActualHeight)
+}
+
+# ---------- KTV 填充进度（有逐字按字，否则回退行级） ----------
+# 有 yrc 逐字时间轴：把「当前时刻」映射成「字符进度」，再换算成裁剪宽度
+#   - 词的起止时刻是真实数据，所以不再出现"整行按时间匀速爬"导致的早亮/晚亮半拍
+#   - 词内部仍是线性插值（词很短，看不出来）
+# 没有逐字数据：完全回退到正式版的行级线性，行为一致
+$script:KtvLine = $null
+function Get-KtvFraction($ln, [double]$pos, [double]$lineStart, [double]$lineDur) {
+    $ws = $ln.w
+    if ($ws -and @($ws).Count -gt 1) {
+        if (-not [object]::ReferenceEquals($script:KtvLine, $ln)) {
+            $cum = @(0.0); $starts = @(); $durs = @(); $total = 0.0
+            foreach ($w in @($ws)) {
+                $starts += ([double]$w[0] / 1000.0)
+                $durs   += ([double]$w[1] / 1000.0)
+                $total  += ([string]$w[2]).Length
+                $cum    += $total
+            }
+            $script:KtvLine = $ln; $script:KtvStarts = $starts
+            $script:KtvDurs = $durs; $script:KtvCum = $cum; $script:KtvTotal = $total
+            $script:KtvIdx = 0
+        }
+        if ($script:KtvTotal -gt 0) {
+            $n = @($script:KtvStarts).Count
+            # 播放位置通常单调前进，从上次的索引继续走即可（均摊 O(1)，不必每帧从头扫）
+            $i = [int]$script:KtvIdx
+            if ($i -ge $n) { $i = $n - 1 }
+            if ($i -lt 0) { $i = 0 }
+            while ($i -gt 0 -and $pos -lt [double]$script:KtvStarts[$i]) { $i-- }          # 拖进度条回退
+            while (($i + 1) -lt $n -and $pos -ge [double]$script:KtvStarts[$i + 1]) { $i++ }
+            $script:KtvIdx = $i
+
+            $st = [double]$script:KtvStarts[$i]
+            if ($pos -lt $st) {
+                # 还没唱到第 i 个词 —— 停在"前面几个词已唱满"的位置。
+                # 注意这里不能返回 1.0：老版本在这一分支直接返回 cum[n]/total(=100%)，
+                # 于是词与词之间的空隙会让整行瞬间填满、下个词开始又弹回去，看起来就是"太快"。
+                return [double]$script:KtvCum[$i] / [double]$script:KtvTotal
+            }
+            $du = [double]$script:KtvDurs[$i]
+            if ($du -lt 0.02) { $du = 0.02 }
+            $cl = [double]$script:KtvCum[$i + 1] - [double]$script:KtvCum[$i]
+            if ($pos -le ($st + $du)) {
+                $r = ([double]$script:KtvCum[$i] + ((($pos - $st) / $du) * $cl)) / [double]$script:KtvTotal
+                if ($r -gt 1) { $r = 1 }
+                return $r
+            }
+            # 这个词也唱完了：停在它的结束位置，等下一个词
+            if (($i + 1) -ge $n) { return 1.0 }
+            return [double]$script:KtvCum[$i + 1] / [double]$script:KtvTotal
+        }
+    }
+    # 没有逐字数据：行级线性推进
+    $frac = ($pos - $lineStart) / $lineDur
+    if ($frac -lt 0) { $frac = 0 }
+    if ($frac -gt 1) { $frac = 1 }
+    return $frac
 }
 
 # ---------- 托盘 / 菜单 ----------
@@ -740,6 +841,10 @@ foreach ($L in @(
     }))
 }
 [void]$menu.Items.Add($miLayout)
+# 文字投影：配置里一直有 Shadow 这个键、README 也写了，但以前没有开关（等于文档写了没实现）
+[void]$menu.Items.Add((New-MenuItem '文字投影（阴影）' $null {
+    $CFG.Shadow = -not [bool]$CFG.Shadow; Apply-Shadow; Save-Cfg
+} { $CFG.Shadow }))
 
 function Get-Font-Info {
     return ("主歌词 {0} 磅   翻译 {1}% = {2}   下一句 {3}% = {4}" -f [int]$CFG.FontSize,
@@ -818,16 +923,18 @@ foreach ($pct in 100, 85, 70, 55, 40, 25) {
 [void]$menu.Items.Add('-')
 
 $miCal = New-Object System.Windows.Forms.ToolStripMenuItem('歌词校准（比实际演唱早晚）')
-[void]$miCal.DropDownItems.Add((New-MenuItem '歌词提前 0.2s' ([double]0.2) {
-    param($sender, $e)
-    $CFG.LyricsOffset = [math]::Round(([double]$CFG.LyricsOffset + [double]$sender.Tag), 2); Save-Cfg
-    try { $ni.ShowBalloonTip(1200, '歌词校准', ("当前 " + $CFG.LyricsOffset + " 秒（正值=歌词提前）"), [System.Windows.Forms.ToolTipIcon]::Info) } catch { }
-}))
-[void]$miCal.DropDownItems.Add((New-MenuItem '歌词延后 0.2s' ([double]-0.2) {
-    param($sender, $e)
-    $CFG.LyricsOffset = [math]::Round(([double]$CFG.LyricsOffset + [double]$sender.Tag), 2); Save-Cfg
-    try { $ni.ShowBalloonTip(1200, '歌词校准', ("当前 " + $CFG.LyricsOffset + " 秒（正值=歌词提前）"), [System.Windows.Forms.ToolTipIcon]::Info) } catch { }
-}))
+foreach ($c in @(
+    @{ n = '歌词提前 0.2s'; d =  0.2  },
+    @{ n = '歌词延后 0.2s'; d = -0.2  },
+    @{ n = '微调提前 0.05s'; d =  0.05 },
+    @{ n = '微调延后 0.05s'; d = -0.05 }
+)) {
+    [void]$miCal.DropDownItems.Add((New-MenuItem $c.n ([double]$c.d) {
+        param($sender, $e)
+        $CFG.LyricsOffset = [math]::Round(([double]$CFG.LyricsOffset + [double]$sender.Tag), 2); Save-Cfg
+        try { $ni.ShowBalloonTip(1200, '歌词校准', ("当前 " + $CFG.LyricsOffset + " 秒（正值=歌词提前）"), [System.Windows.Forms.ToolTipIcon]::Info) } catch { }
+    }))
+}
 [void]$miCal.DropDownItems.Add('-')
 [void]$miCal.DropDownItems.Add((New-MenuItem '重置为 0' $null { $CFG.LyricsOffset = 0.0; Save-Cfg }))
 [void]$menu.Items.Add($miCal)
@@ -847,9 +954,10 @@ $miCal = New-Object System.Windows.Forms.ToolStripMenuItem('歌词校准（比�
 [void]$menu.Items.Add((New-MenuItem '退出' $null {
     Save-Cfg
     try { $ni.Visible = $false; $ni.Dispose() } catch { }
-    if ($script:FetchJob) {
-        Stop-Job $script:FetchJob -ErrorAction SilentlyContinue
-        Remove-Job $script:FetchJob -Force -ErrorAction SilentlyContinue
+    if ($script:FetchProc) {
+        try { if (-not $script:FetchProc.HasExited) { $script:FetchProc.Kill() } } catch { }
+        try { $script:FetchProc.Dispose() } catch { }
+        $script:FetchProc = $null
     }
     $win.Close()
     [System.Windows.Threading.Dispatcher]::CurrentDispatcher.InvokeShutdown()
@@ -935,7 +1043,7 @@ $script:RenderHandler = [System.EventHandler]{
 }
 [System.Windows.Media.CompositionTarget]::add_Rendering($script:RenderHandler)
 
-Log ("overlay v8 started (node='$NodeExe', anchor=$($CFG.Anchor), font=$($CFG.FontSize)/$($CFG.TransFontSize)/$($CFG.NextFontSize), karaoke=$([bool]$CFG.Karaoke), smtcPoll=$($CFG.PollMs)ms, render=CompositionTarget)")
+Log ("overlay v9 started (node='$NodeExe', anchor=$($CFG.Anchor), font=$($CFG.FontSize)/$($CFG.TransFontSize)/$($CFG.NextFontSize), karaoke=$([bool]$CFG.Karaoke), smtcPoll=$($CFG.PollMs)ms, render=CompositionTarget)")
 [System.Windows.Threading.Dispatcher]::Run() | Out-Null
 [System.Windows.Media.CompositionTarget]::remove_Rendering($script:RenderHandler)
 Save-Cfg

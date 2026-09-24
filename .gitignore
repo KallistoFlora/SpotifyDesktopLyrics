@@ -5,13 +5,6 @@ lyrics-overlay.log
 lyrics-overlay.log.old
 _lyr_req.json
 _lyr_out.json
-# 逐字试验版那套（文件名带 -yrc）
-lyrics-overlay-yrc.json
-lyrics-cache-yrc.json
-lyrics-overlay-yrc.log
-lyrics-overlay-yrc.log.old
-_lyr_req_yrc.json
-_lyr_out_yrc.json
 
 # ---- 通用 ----
 *.log
@@ -23,9 +16,3 @@ desktop.ini
 
 # ---- 本地辅助脚本（含 token 流程，不发布） ----
 push-to-github.cmd
-
-# ---- 逐字试验版：只在本机跑，不入库（等验证通过再决定合并或删除） ----
-lyrics-fetch-yrc.js
-lyrics-overlay-yrc.ps1
-run-lyrics-yrc.cmd
-start-lyrics-yrc.vbs
