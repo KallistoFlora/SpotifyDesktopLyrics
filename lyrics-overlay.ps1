@@ -613,6 +613,10 @@ function Render-Tick {
 # ---------- 托盘 / 菜单 ----------
 $ni = New-Object System.Windows.Forms.NotifyIcon
 $ni.Icon = [System.Drawing.SystemIcons]::Application
+$TrayIco = Join-Path $ScriptDir 'tray.ico'
+if (Test-Path $TrayIco) {
+    try { $ni.Icon = New-Object System.Drawing.Icon($TrayIco, 16, 16) } catch { }
+}
 $ni.Text = 'Spotify 桌面歌词'
 $ni.Visible = $true
 
