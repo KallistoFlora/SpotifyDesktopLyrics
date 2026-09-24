@@ -1,0 +1,17 @@
+# 统一换行符：Windows 脚本必须 CRLF，否则 cmd.exe 的 goto/label 会出错
+* text=auto
+*.ps1  text eol=crlf
+*.cmd  text eol=crlf
+*.vbs  text eol=crlf
+*.bat  text eol=crlf
+
+# 文本文件按 LF 存储，避免不同平台 diff 噪音
+*.js   text eol=lf
+*.json text eol=lf
+*.md   text eol=lf
+
+# 二进制
+*.png binary
+*.jpg binary
+*.ico binary
+*.gif binary

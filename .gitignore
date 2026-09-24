@@ -1,0 +1,18 @@
+# ---- 运行时生成的文件：含个人数据（听歌记录、位置、设置），不要提交 ----
+lyrics-overlay.json
+lyrics-cache.json
+lyrics-overlay.log
+lyrics-overlay.log.old
+_lyr_req.json
+_lyr_out.json
+
+# ---- 通用 ----
+*.log
+*.tmp
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+
+# ---- 本地辅助脚本（含 token 流程，不发布） ----
+push-to-github.cmd
