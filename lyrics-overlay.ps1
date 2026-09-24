@@ -189,8 +189,6 @@ function Get-NowPlaying {
 
 # ---------- 歌词抓取 ----------
 # 直接跑 node 进程，不再用 Start-Job。
-
-# 直接跑 node 进程，不再用 Start-Job。
 # Start-Job 每次抓取都会额外起一个完整的 PowerShell 子进程（实测几十 MB + 几百毫秒启动），
 # 而我们只需要 node 跑完、结果落在 OutFile 里 —— 那个中间进程纯属浪费。
 function Start-NodeProcess([string]$nodeExe, [string]$jsFile, [string]$reqFile, [string]$outFile, [string]$cacheFile) {
