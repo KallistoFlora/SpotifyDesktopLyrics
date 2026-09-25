@@ -263,10 +263,13 @@ $xaml = @"
                    TextAlignment="Center" TextWrapping="Wrap" MaxWidth="$($CFG.MaxWidth)">
           $shadow
         </TextBlock>
+        <!-- CurFill 是叠在 Cur 上面的"已唱部分"，故意不加投影效果：
+             Cur 在同一位置画着完全相同的字形、也带着同一个投影，
+             CurFill 再加一次纯属重复计算（而且它每帧都在改裁剪矩形）。
+             去掉后视觉完全一致，但省掉一次模糊渲染。 -->
         <TextBlock x:Name="CurFill" FontFamily="Microsoft YaHei UI" FontWeight="Bold"
                    FontSize="$($CFG.FontSize)" Foreground="$($CFG.TextColor)"
                    TextAlignment="Center" TextWrapping="Wrap" MaxWidth="$($CFG.MaxWidth)">
-          $shadow
           <TextBlock.Clip><RectangleGeometry x:Name="CurClip" Rect="0,0,0,0"/></TextBlock.Clip>
         </TextBlock>
       </Grid>
@@ -317,7 +320,9 @@ function Apply-Shadow {
             $eff.ShadowDepth = 0
             $eff.Opacity     = 0.95
         }
-        foreach ($tb in @($cur, $curFill, $trans, $next)) { $tb.Effect = $eff }
+        # 只给 Cur 加投影，不给 CurFill（它叠在 Cur 上、字形完全一样，投影重复且每帧重算）
+        foreach ($tb in @($cur, $trans, $next)) { $tb.Effect = $eff }
+        $curFill.Effect = $null
     } catch { Log ("apply-shadow error: " + $_.Exception.Message) }
 }
 
@@ -453,6 +458,7 @@ $script:NoSessionFrom = $null
 $script:FailText      = ''
 $script:KaraokeFrac   = -1.0
 $script:FreshFrom     = $null      # 换歌时刻；之后 1.5 秒内位置直接硬对齐
+$script:LastKtvT      = 0.0        # 上一次更新 KTV 裁剪的时刻（限制更新频率用）
 
 function Start-Fetch([string]$artist, [string]$title, [string]$album, [double]$duration) {
     if ($script:FetchProc) {
@@ -606,8 +612,10 @@ function Poll-Smtc {
     Complete-Fetch
 
     # 保险：WPF 对完全静止的视觉树可能不再触发 Rendering 回调，那样帧时钟就停了。
-    # 轮询时主动请求一次重绘，确保动画时钟持续走动。
-    if ($script:Playing) { try { $curFill.InvalidateVisual() } catch { } }
+    # 但播放中 KTV 每帧都在改裁剪矩形，视觉树本来就不静止 —— 那一刀是白挨的
+    # （而且会连带把文字和投影重算一遍），所以只在"不会自己重绘"时才补这一下。
+    $animating = $script:Playing -and [bool]$CFG.Karaoke -and $script:LastIdx -ge 0
+    if (-not $animating) { try { $curFill.InvalidateVisual() } catch { } }
 }
 
 # ---------- 每帧（60fps）：累加位置、更新文字与 KTV 填充 ----------
@@ -690,6 +698,10 @@ function Render-Tick {
     $dur = $end - $start
     if ($dur -le 0.2) { $dur = 0.2 }
     if ($dur -gt 8) { $dur = 8 }          # 长间奏时 8 秒内填满，不要慢吞吞爬
+    # 更新频率上限 ~70Hz：CompositionTarget.Rendering 跟的是显示器刷新率，
+    # 100Hz / 165Hz 屏上会白跑 40%~140% 的帧，而这个填充每帧只挪几个像素，看不出区别
+    if (($t - $script:LastKtvT) -lt 0.014) { return }
+    $script:LastKtvT = $t
     # 【逐字】有逐字时间轴就按字推进，没有则回退到行级线性
     $frac = Get-KtvFraction $script:Lyrics[$idx] $effPos $start $dur
     if ([math]::Abs($frac - $script:KaraokeFrac) -lt 0.0015) { return }   # 变化太小就不重绘
@@ -818,6 +830,8 @@ $menu = New-Object System.Windows.Forms.ContextMenuStrip
 [void]$menu.Items.Add((New-MenuItem '◀◀  上一首' $null { Invoke-Playback 'prev' }))
 [void]$menu.Items.Add((New-MenuItem '▶   播放 / 暂停' $null { Invoke-Playback 'toggle' }))
 [void]$menu.Items.Add((New-MenuItem '▶▶  下一首' $null { Invoke-Playback 'next' }))
+[void]$menu.Items.Add((New-MenuItem '⏪  快退' $null { Invoke-Playback 'rew' }))
+[void]$menu.Items.Add((New-MenuItem '⏩  快进' $null { Invoke-Playback 'fwd' }))
 [void]$menu.Items.Add('-')
 
 [void]$menu.Items.Add((New-MenuItem '显示歌词' $null { if ($win.IsVisible) { $win.Hide() } else { $win.Show() } } { $win.IsVisible }))
