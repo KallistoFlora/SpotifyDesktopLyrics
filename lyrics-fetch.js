@@ -1,15 +1,16 @@
 'use strict';
-// 歌词抓取器 v4：LRCLIB 五段式级联 + 网易云 yrc 逐字时间轴
-// 用法: node lyrics-fetch-yrc.js <请求json> <输出json> [缓存json]
-// 与 v3 的区别：
-//   1) 网易云 lyric 接口加 &yv=-1，取 yrc（逐字）与 ytlrc（逐字翻译）
-//   2) 有 yrc 时，直接把网易云的 yrc 行当作主歌词（它自带每行的逐字时间轴）
-//      没有 yrc 时，行为与 v3 完全一致（LRCLIB 为主 + 网易云只供翻译）
-//   3) 输出的每一行多一个 w 字段：[[起始ms, 时长ms, 文本], ...]（绝对毫秒）
-//   4) 输出每行可带词级时间轴 w，供 KTV 按字填充
+// 歌词抓取器 v5
+// 用法: node lyrics-fetch.js <请求json> <输出json> [缓存json]
+// 取词链路（越精确越先试，任何一步成功即返回）：
+//   LRCLIB  五段式级联（get+时长 → get → 结构化搜索 → 自由文本 → 只搜歌名），503 退避重试
+//   网易云  双接口搜索 + yrc 逐字时间轴 + tlyric 翻译
+//   酷狗    KRC 逐字（补网易云没有逐字的歌）；原文/逐字之外无翻译
+//   QQ音乐  仅行级原文兜底（翻译与逐字需要登录态，实测取不到）
+// 每行的 w 字段 = [[起始ms, 时长ms, 文本], ...]（统一成绝对毫秒，供 KTV 按字填充）
 
 const fs = require('fs');
 const path = require('path');
+const zlib = require('zlib');
 
 function out(p, obj) { try { fs.writeFileSync(p, JSON.stringify(obj), 'utf8'); } catch (e) { } }
 function norm(s) { return String(s || '').replace(/\s+/g, ''); }
@@ -18,7 +19,7 @@ function norm(s) { return String(s || '').replace(/\s+/g, ''); }
 // 网易云对「没版权 / 已下架」的歌（例如罗大佑的部分作品）不会返回空，
 // 而是返回该歌手其他热门歌或同名翻唱。旧版只对歌手名不匹配扣 25 分、
 // 从不拒绝，于是会拿《东方之珠》的逐字/歌词去配《皇后大道东》。
-const CACHE_VER = 3;                       // 判定逻辑变了 -> 旧缓存作废
+const CACHE_VER = 4;                       // 取词链加了源 -> 旧缓存作废（顺便让老歌补上逐字）
 function normKey(s) {
     return String(s || '').toLowerCase()
         .replace(/[\(\[（【][^\)\]）】]*[\)\]）】]/g, '')   // 去掉 (Live) (Remastered) 之类
@@ -302,6 +303,121 @@ async function netease(q) {
     return r;
 }
 
+// ---------- 酷狗：KRC 逐字（补网易云没有逐字的歌） ----------
+// KRC 是加密的：文件头 "krc1"(4 字节)，**从偏移 4 开始**整段与 16 字节固定密钥循环
+// XOR，然后 zlib 压缩。两个容易踩错的点（实测出来的，网上流传的版本会解不出来）：
+//   1) 密钥**不做**"前 4 字节混合"
+//   2) 密文从 **偏移 4** 开始，不是 8
+const KRC_KEY = Buffer.from([0x40, 0x47, 0x61, 0x77, 0x5e, 0x32, 0x74, 0x47, 0x51, 0x36, 0x31, 0x2d, 0xce, 0xd2, 0x6e, 0x69]);
+function krcDecrypt(buf) {
+    try {
+        if (buf.length < 32 || buf.slice(0, 4).toString('latin1') !== 'krc1') return null;
+        const body = Buffer.from(buf.slice(4));
+        for (let i = 0; i < body.length; i++) body[i] ^= KRC_KEY[i % 16];
+        return zlib.inflateSync(body).toString('utf8');
+    } catch { return null; }
+}
+// 明文格式: [行起始ms,行时长ms]<词起始ms(相对行首),词时长ms,0>词文本...
+// 词时间是**相对行首**的，必须加上行起始，统一成绝对毫秒（和网易云 yrc 一致）
+function parseKrc(text) {
+    if (!text) return [];
+    const out = [];
+    for (const raw of String(text).split(/\r?\n/)) {
+        const line = raw.replace(/^\uFEFF/, '').trim();
+        const m = /^\[(\d+),(\d+)\](.*)$/.exec(line);
+        if (!m) continue;
+        const tMs = parseInt(m[1], 10), dMs = parseInt(m[2], 10), rest = m[3];
+        const words = [];
+        const rx = /<(\d+),(\d+),\d+>/g;
+        let mm, prev = null, prevEnd = 0;
+        while ((mm = rx.exec(rest)) !== null) {
+            if (prev) { const txt = rest.slice(prevEnd, mm.index); if (txt) words.push([prev[0], prev[1], txt]); }
+            prev = [tMs + parseInt(mm[1], 10), parseInt(mm[2], 10)];
+            prevEnd = rx.lastIndex;
+        }
+        if (prev) { const tail = rest.slice(prevEnd); if (tail) words.push([prev[0], prev[1], tail]); }
+        const s = words.map((w) => w[2]).join('').trim();
+        if (!s) continue;
+        out.push({ t: tMs / 1000, s, d: dMs, w: words });
+    }
+    out.sort((a, b) => a.t - b.t);
+    return out;
+}
+async function kugou(q) {
+    const h = { 'Referer': 'https://www.kugou.com/' };
+    try {
+        const s = await jget('https://songsearch.kugou.com/song_search_v2?keyword=' +
+            encodeURIComponent(q.artist + ' ' + q.title) + '&page=1&pagesize=8&platform=WebFilter', 12000, h);
+        if (s.status !== 200) return null;
+        let sj = null; try { sj = JSON.parse(s.text); } catch { return null; }
+        const list = ((sj.data && sj.data.lists) || []).filter((x) => {
+            if (titleMatch(x.SongName, q.title) === 0) return false;
+            if (artistMatch(x.SingerName, q.artist) > 0) return true;
+            if (!q.duration || !x.Duration) return false;
+            return Math.abs(x.Duration / 1000 - q.duration) <= 3;
+        });
+        if (!list.length) return null;
+        const rank = (x) => (artistMatch(x.SingerName, q.artist) > 0 ? 0 : 1000) + Math.abs((x.Duration || 0) / 1000 - (q.duration || 0));
+        list.sort((a, b) => rank(a) - rank(b));
+        const pick = list[0];
+
+        const kr = await jget('https://krcs.kugou.com/search?ver=1&man=yes&client=mobi&keyword=' +
+            encodeURIComponent(pick.FileHash) + '&duration=' + pick.Duration + '&hash=' + pick.FileHash, 12000, h);
+        if (kr.status !== 200) return null;
+        let kj = null; try { kj = JSON.parse(kr.text); } catch { return null; }
+        const c = (kj.candidates || [])[0];
+        if (!c || !c.id || !c.accesskey) return null;
+
+        const d = await jget('https://lyrics.kugou.com/download?ver=1&client=pc&id=' + c.id +
+            '&accesskey=' + c.accesskey + '&fmt=krc&charset=utf8', 12000, h);
+        if (d.status !== 200) return null;
+        let dj = null; try { dj = JSON.parse(d.text); } catch { return null; }
+        if (!dj.content) return null;
+        const text = krcDecrypt(Buffer.from(dj.content, 'base64'));
+        if (!text) return null;
+        const lines = parseKrc(text);
+        if (!lines.length) return null;
+        const wordLines = lines.filter((l) => l.w && l.w.length > 1).length;
+        return {
+            src: 'kugou/krc', name: (pick.SingerName || '') + ' - ' + (pick.SongName || ''),
+            lines, hasWords: wordLines > 0, wordLines, trans: [],
+        };
+    } catch { return null; }
+}
+
+// ---------- QQ音乐：仅行级原文兜底 ----------
+// 说明：QQ 的翻译(trans)与逐字(qrc)字段存在但实测恒为空，需要登录态才给。
+// 所以这里只当"最后一道行级兜底"，不当主要来源。
+async function qqMusic(q) {
+    const h = { 'Referer': 'https://y.qq.com/portal/player.html' };
+    try {
+        const s = await jget('https://c.y.qq.com/soso/fcgi-bin/search_for_qq_cp?w=' +
+            encodeURIComponent(q.artist + ' ' + q.title) + '&format=json&n=8&p=1', 12000, h);
+        if (s.status !== 200) return null;
+        let sj = null; try { sj = JSON.parse(s.text); } catch { return null; }
+        const singerOf = (x) => (x.singer || []).map((y) => y.name).join('/');
+        const list = ((sj.data && sj.data.song && sj.data.song.list) || []).filter((x) => {
+            if (titleMatch(x.songname, q.title) === 0) return false;
+            if (artistMatch(singerOf(x), q.artist) > 0) return true;
+            if (!q.duration || !x.interval) return false;
+            return Math.abs(x.interval - q.duration) <= 3;
+        });
+        if (!list.length) return null;
+        const rank = (x) => (artistMatch(singerOf(x), q.artist) > 0 ? 0 : 1000) + Math.abs((x.interval || 0) - (q.duration || 0));
+        list.sort((a, b) => rank(a) - rank(b));
+        const pick = list[0];
+
+        const lr = await jget('https://c.y.qq.com/lyric/fcgi-bin/fcg_query_lyric_new.fcg?songmid=' + pick.songmid +
+            '&g_tk=5381&format=json&inCharset=utf8&outCharset=utf-8&notice=0&platform=yqq.json&needNewCode=0&nobase64=1', 12000, h);
+        if (lr.status !== 200) return null;
+        let lj = null; try { lj = JSON.parse(lr.text); } catch { return null; }
+        if (!lj.lyric) return null;
+        const lines = parseLrc(lj.lyric);
+        if (!lines.length) return null;
+        return { src: 'qq', name: singerOf(pick) + ' - ' + pick.songname, lines, hasWords: false, wordLines: 0, trans: [] };
+    } catch { return null; }
+}
+
 // ---------- 缓存 ----------
 function cacheKey(q) { return (norm(q.artist) + '|' + norm(q.title) + '|' + Math.round(q.duration || 0)).toLowerCase(); }
 function cacheLoad(p) { try { return JSON.parse(fs.readFileSync(p, 'utf8')) || {}; } catch { return {}; } }
@@ -328,12 +444,29 @@ function cacheSave(p, c) { try { fs.writeFileSync(p, JSON.stringify(c), 'utf8');
     const base = await lrclib(q);
     const ne = await netease(q);
 
+    // 只有在"网易云没给出逐字"时才去问酷狗：KRC 请求链要三次往返，能省则省
+    let kg = null;
+    if (!(ne && ne.hasWords)) kg = await kugou(q);
+
+    // QQ 只做最后的行级兜底：前面三源都没结果时才问（它没有翻译也没有逐字）
+    let qqRes = null;
+    if (!(ne && ne.hasWords) && !(kg && kg.hasWords) && !base && !(ne && ne.lines && ne.lines.length) && !(kg && kg.lines && kg.lines.length)) {
+        qqRes = await qqMusic(q);
+    }
+
     let result = null, info = { pass1: 0, pass2: 0, total: 0, hit: 0 }, transSrc = '';
     if (ne && ne.hasWords) {
         // 有逐字时间轴 -> 用网易云的行当主歌词（翻译已在 neteaseOnce 里配好）
         result = { src: ne.src, name: ne.name, lines: ne.lines };
         info = ne.transInfo || info;
         transSrc = ne.name + ' (' + ne.transKind + ')';
+    } else if (kg && kg.hasWords) {
+        // 网易云没有逐字、酷狗 KRC 有 -> 用酷狗的逐字行，翻译仍借网易云的
+        result = { src: kg.src, name: kg.name, lines: kg.lines };
+        if (ne && ne.trans && ne.trans.length) {
+            info = attachTrans(kg.lines, ne.trans);
+            transSrc = ne.name;
+        }
     } else if (base) {
         result = { src: base.src, name: base.name, lines: base.lines };
         if (ne && ne.trans && ne.trans.length) {
@@ -343,6 +476,10 @@ function cacheSave(p, c) { try { fs.writeFileSync(p, JSON.stringify(c), 'utf8');
     } else if (ne && ne.lines && ne.lines.length) {
         result = { src: ne.src, name: ne.name, lines: ne.lines };
         info = ne.transInfo || info;
+    } else if (kg && kg.lines && kg.lines.length) {
+        result = { src: kg.src, name: kg.name, lines: kg.lines };
+    } else if (qqRes) {
+        result = { src: qqRes.src, name: qqRes.name, lines: qqRes.lines };
     }
 
     if (!result || !result.lines.length) return out(outPath, { ok: false, err: 'no lyrics found' });

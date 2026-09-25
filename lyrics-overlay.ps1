@@ -162,14 +162,42 @@ $MgrType   = [Windows.Media.Control.GlobalSystemMediaTransportControlsSessionMan
 $PropsType = [Windows.Media.Control.GlobalSystemMediaTransportControlsSessionMediaProperties, Windows.Media.Control, ContentType=WindowsRuntime]
 $script:SmtcMgr = Await ($MgrType::RequestAsync()) $MgrType
 
+function Get-SpotifySession {
+    try {
+        foreach ($sess in $script:SmtcMgr.GetSessions()) {
+            if ($sess.SourceAppUserModelId -like '*Spotify*') { return $sess }
+        }
+    } catch { }
+    return $null
+}
+
+# 播放控制：直接调用 SMTC 会话上的控制方法（不模拟媒体按键，所以不会影响前台窗口）
+function Invoke-Playback([string]$action) {
+    $sess = Get-SpotifySession
+    if (-not $sess) {
+        try { $ni.ShowBalloonTip(1500, '播放控制', '没找到 Spotify 媒体会话（先在 Spotify 里放一首歌）', [System.Windows.Forms.ToolTipIcon]::Info) } catch { }
+        return
+    }
+    try {
+        $ok = $false
+        switch ($action) {
+            'toggle' { $ok = Await ($sess.TryTogglePlayPauseAsync()) ([bool]) }
+            'next'   { $ok = Await ($sess.TrySkipNextAsync())        ([bool]) }
+            'prev'   { $ok = Await ($sess.TrySkipPreviousAsync())    ([bool]) }
+            'fwd'    { $ok = Await ($sess.TryFastForwardAsync())     ([bool]) }
+            'rew'    { $ok = Await ($sess.TryRewindAsync())          ([bool]) }
+        }
+        # 让下一次轮询立刻刷新状态，不用等
+        $script:LastSmtc = [datetime]::MinValue
+        if (-not $ok) { Log ("playback control '{0}' returned false" -f $action) }
+    } catch { Log ("playback control error (" + $action + "): " + $_.Exception.Message) }
+}
+
 function Get-NowPlaying {
     try {
         # 用 foreach 而不是 Where-Object | Select-Object：管道在 PowerShell 里开销明显，
         # 而这个函数每个轮询周期都要跑一次
-        $s = $null
-        foreach ($sess in $script:SmtcMgr.GetSessions()) {
-            if ($sess.SourceAppUserModelId -like '*Spotify*') { $s = $sess; break }
-        }
+        $s = Get-SpotifySession
         if (-not $s) { return $null }
         $p  = Await ($s.TryGetMediaPropertiesAsync()) $PropsType
         $tl = $s.GetTimelineProperties()
@@ -796,6 +824,12 @@ function Sync-MenuChecks {
 
 $menu = New-Object System.Windows.Forms.ContextMenuStrip
 
+# ---------- 播放控制（托盘菜单里随时可用；鼠标操作要求未锁定） ----------
+[void]$menu.Items.Add((New-MenuItem '◀◀  上一首' $null { Invoke-Playback 'prev' }))
+[void]$menu.Items.Add((New-MenuItem '▶   播放 / 暂停' $null { Invoke-Playback 'toggle' }))
+[void]$menu.Items.Add((New-MenuItem '▶▶  下一首' $null { Invoke-Playback 'next' }))
+[void]$menu.Items.Add('-')
+
 [void]$menu.Items.Add((New-MenuItem '显示歌词' $null { if ($win.IsVisible) { $win.Hide() } else { $win.Show() } } { $win.IsVisible }))
 [void]$menu.Items.Add((New-MenuItem '锁定位置（鼠标穿透）' $null {
     $CFG.Locked = -not [bool]$CFG.Locked
@@ -980,6 +1014,27 @@ $script:DragWinT   = 0.0
 
 $win.Add_MouseEnter({ Update-Hover $true })
 $win.Add_MouseLeave({ Update-Hover $false })
+
+# 中键单击 = 播放/暂停（滚轮 = 上/下一首，带 700ms 防抖，免得滚一下跳好几首）
+$script:LastSkip = [datetime]::MinValue
+$win.Add_MouseDown({
+    param($sender, $e)
+    if ([bool]$CFG.Locked) { return }
+    if ($e.ChangedButton -eq [System.Windows.Input.MouseButton]::Middle) {
+        Invoke-Playback 'toggle'
+        $e.Handled = $true
+    }
+})
+$win.Add_MouseWheel({
+    param($sender, $e)
+    if ([bool]$CFG.Locked) { return }
+    $now = Get-Date
+    if (($now - $script:LastSkip).TotalMilliseconds -lt 700) { $e.Handled = $true; return }
+    $script:LastSkip = $now
+    if ($e.Delta -gt 0) { Invoke-Playback 'prev' } else { Invoke-Playback 'next' }
+    $e.Handled = $true
+})
+
 $win.Add_MouseRightButtonDown({
     if ([bool]$CFG.Locked) { return }
     $script:Dragging = $false
