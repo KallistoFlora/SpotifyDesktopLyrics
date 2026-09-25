@@ -188,7 +188,6 @@ function Invoke-Playback([string]$action) {
             'rew'    { $ok = Await ($sess.TryRewindAsync())          ([bool]) }
         }
         # 让下一次轮询立刻刷新状态，不用等
-        $script:LastSmtc = [datetime]::MinValue
         if (-not $ok) { Log ("playback control '{0}' returned false" -f $action) }
     } catch { Log ("playback control error (" + $action + "): " + $_.Exception.Message) }
 }
@@ -229,25 +228,6 @@ function Start-NodeProcess([string]$nodeExe, [string]$jsFile, [string]$reqFile, 
     return [System.Diagnostics.Process]::Start($psi)
 }
 
-function Get-CachedLyrics([string]$artist, [string]$title, [double]$duration) {
-    try {
-        if (-not (Test-Path $CacheFile)) { return $null }
-        $key = ((($artist -replace '\s', '') + '|' + ($title -replace '\s', '') + '|' + [int][math]::Round($duration))).ToLower()
-        $raw = Get-Content $CacheFile -Raw -Encoding UTF8
-        # 先用一次字符串包含判断挡掉"缓存里压根没这首歌"（换歌时最常见）：
-        # 缓存涨到 150KB+ 后 ConvertFrom-Json 要 30ms 以上，而字符串匹配只要 0.25ms
-        if ($raw.IndexOf($key, [System.StringComparison]::OrdinalIgnoreCase) -lt 0) { return $null }
-        $cache = $raw | ConvertFrom-Json
-        $prop  = $cache.PSObject.Properties | Where-Object { $_.Name -eq $key } | Select-Object -First 1
-        if (-not $prop) { return $null }
-        $e = $prop.Value
-        if (-not $e -or -not $e.lines -or @($e.lines).Count -eq 0) { return $null }
-        $now = [int]((Get-Date).ToUniversalTime() - [datetime]'1970-01-01').TotalSeconds
-        $ttl = 0; if ($null -ne $e.ttl) { $ttl = [int]$e.ttl }
-        if (($now - [int]$e.ts) -ge $ttl) { return $null }
-        return $e
-    } catch { Log ("cache read error: " + $_.Exception.Message) -Throttle; return $null }
-}
 
 # ---------- 颜色 / 字号 ----------
 function HexToWpfColor([string]$hex) {
@@ -463,7 +443,6 @@ $script:BasePos       = 0.0      # 逐帧累加得到的播放位置
 $script:PosBias       = 0.0      # 与 SMTC 的平滑修正量
 $script:Clock         = [System.Diagnostics.Stopwatch]::StartNew()   # 单调高精度时钟
 $script:LastFrame     = 0.0
-$script:LastSmtc      = [datetime]::MinValue
 $script:FetchProc      = $null
 $script:FetchStart    = Get-Date
 $script:LastIdx       = -2
@@ -473,6 +452,7 @@ $script:LastPos       = 0.0
 $script:NoSessionFrom = $null
 $script:FailText      = ''
 $script:KaraokeFrac   = -1.0
+$script:FreshFrom     = $null      # 换歌时刻；之后 1.5 秒内位置直接硬对齐
 
 function Start-Fetch([string]$artist, [string]$title, [string]$album, [double]$duration) {
     if ($script:FetchProc) {
@@ -491,16 +471,10 @@ function Start-Fetch([string]$artist, [string]$title, [string]$album, [double]$d
         Log "fetch impossible: node='$NodeExe' js=$FetchJs"
         return
     }
-    $cached = $null
-    if (-not [bool]$script:ForceFetch) { $cached = Get-CachedLyrics $artist $title $duration }
-    if ($cached) {
-        $script:Lyrics      = @($cached.lines)
-        $script:LyricsState = 'ready'
-        $script:HasTrans    = ([int]$cached.transCount -gt 0)
-        $script:LyricsSrc   = "$($cached.src) · $($cached.name)  [缓存]"
-        Log ("cache hit: {0}  ({1} lines, trans {2})" -f $cached.name, @($cached.lines).Count, $cached.transCount)
-        return
-    }
+    # 缓存查表交给 node 做，PowerShell 这边不再自己解析缓存文件。
+    # 原因：缓存里带逐字数据，一个文件 1~2 年后会涨到几百 KB，而 PowerShell 的
+    # ConvertFrom-Json 是同步的 —— 实测 160KB 就要 72ms，全部卡在 UI 线程上；
+    # node 那边 JSON.parse 快得多，而且是子进程、不阻塞界面。
     # force = 菜单里点了"重新获取歌词"：跳过缓存，逼抓取器重新去问一遍数据源
     $reqJson = @{ artist = $artist; title = $title; album = $album; duration = [int]$duration; force = [bool]$script:ForceFetch } | ConvertTo-Json -Compress
     $script:ForceFetch = $false
@@ -578,10 +552,23 @@ function Poll-Smtc {
         if ($key -ne $script:TrackKey) {
             $script:TrackKey  = $key
             $script:Duration  = $np.Duration
-            $script:BasePos   = $np.Position
+            # 换歌这一轮也必须补上采样滞后。
+            # Spotify 报的 Position 更新很稀疏（实测能停在同一个值上 4 秒以上不动），
+            # 直接拿原始值当基准会让歌词整体慢 1~4 秒，而且之后要好几轮才吸收回来
+            # ——这就是"新播放的歌慢一两秒"的根因。
+            $est = [double]$np.Position
+            if (($np.Status -eq 'Playing') -and $np.Updated) {
+                $lag = ($now - $np.Updated).TotalSeconds
+                if ($lag -gt 0 -and $lag -lt 30) { $est += $lag }
+            }
+            $script:BasePos   = $est
             $script:PosBias   = 0.0
             $script:LastFrame = $script:Clock.Elapsed.TotalSeconds
             $script:LastPos   = 0.0
+            # 这一轮也要更新播放状态：否则暂停状态下切歌，本轮不会累加帧时钟
+            $script:Playing   = ($np.Status -eq 'Playing')
+            # 换歌后开一个短暂窗口，期间完全信任估算值（见下面 else 分支）
+            $script:FreshFrom = $now
             Start-Fetch $np.Artist $np.Title $np.Album $np.Duration
         } else {
             # 用 LastUpdatedTime 补上采样滞后，得到更接近真实的位置
@@ -591,8 +578,11 @@ function Poll-Smtc {
                 if ($lag -gt 0 -and $lag -lt 30) { $est += $lag }
             }
             $drift = $est - ($script:BasePos + $script:PosBias)
-            if ([math]::Abs($drift) -gt 2.5) {
-                # 真正的跳转（拖动进度条/换曲）：直接对齐
+            # 换歌后 1.5 秒内直接对齐（不按 25% 慢慢吸收）：这段时间估算值本来就最可信，
+            # 慢慢吸收只会让开头那一两秒一直滞后
+            $fresh = $script:FreshFrom -and ((($now - $script:FreshFrom)).TotalSeconds -lt 1.5)
+            if ([math]::Abs($drift) -gt 2.5 -or $fresh) {
+                # 真正的跳转（拖动进度条/换曲）或刚换歌：直接对齐
                 $script:BasePos = $est; $script:PosBias = 0.0
             } else {
                 # 平滑吸收误差：每次只吸收 25%，位置连续变化，画面不会跳
@@ -971,7 +961,7 @@ foreach ($c in @(
 [void]$miCal.DropDownItems.Add((New-MenuItem '重置为 0' $null { $CFG.LyricsOffset = 0.0; Save-Cfg }))
 [void]$menu.Items.Add($miCal)
 
-[void]$menu.Items.Add((New-MenuItem '重新获取歌词（忽略缓存）' $null { $script:ForceFetch = $true; $script:TrackKey = ''; $script:LastSmtc = [datetime]::MinValue }))
+[void]$menu.Items.Add((New-MenuItem '重新获取歌词（忽略缓存）' $null { $script:ForceFetch = $true; $script:TrackKey = '' }))
 [void]$menu.Items.Add((New-MenuItem '把状态写进日志' $null {
     Log ("state: {0} | {1} | anchor={2} font={3}/{4}/{5} karaoke={6} offset={7} poll={8}ms" -f `
         $script:LyricsState, $script:LyricsSrc, $CFG.Anchor, $CFG.FontSize, $CFG.TransFontSize, $CFG.NextFontSize, [bool]$CFG.Karaoke, $CFG.LyricsOffset, $CFG.PollMs)

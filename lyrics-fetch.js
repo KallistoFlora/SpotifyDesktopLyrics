@@ -422,6 +422,15 @@ async function qqMusic(q) {
 function cacheKey(q) { return (norm(q.artist) + '|' + norm(q.title) + '|' + Math.round(q.duration || 0)).toLowerCase(); }
 function cacheLoad(p) { try { return JSON.parse(fs.readFileSync(p, 'utf8')) || {}; } catch { return {}; } }
 function cacheSave(p, c) { try { fs.writeFileSync(p, JSON.stringify(c), 'utf8'); } catch { } }
+// 缓存上限：带逐字的数据每条 6~16KB，不封顶会一直长下去（文件越大越慢，也越难备份）。
+// 超了就按写入时间丢掉最老的。150 条足够覆盖日常反复听的那批歌。
+function cacheTrim(c, maxEntries) {
+    const keys = Object.keys(c);
+    if (keys.length <= maxEntries) return c;
+    keys.sort((a, b) => (c[a].ts || 0) - (c[b].ts || 0));
+    for (const k of keys.slice(0, keys.length - maxEntries)) delete c[k];
+    return c;
+}
 
 // ---------- 主流程 ----------
 (async () => {
@@ -441,8 +450,9 @@ function cacheSave(p, c) { try { fs.writeFileSync(p, JSON.stringify(c), 'utf8');
         return out(outPath, Object.assign({}, hit, { cached: true }));
     }
 
-    const base = await lrclib(q);
-    const ne = await netease(q);
+    // LRCLIB 与网易云互不依赖 -> 并行请求。
+    // 串行做是 2~8 个网络来回，新歌第一次播放要等 1~3 秒才出词；并行后只等最慢的那条链。
+    const [base, ne] = await Promise.all([lrclib(q), netease(q)]);
 
     // 只有在"网易云没给出逐字"时才去问酷狗：KRC 请求链要三次往返，能省则省
     let kg = null;
@@ -520,6 +530,6 @@ function cacheSave(p, c) { try { fs.writeFileSync(p, JSON.stringify(c), 'utf8');
         hasWords: payload.hasWords, wordLines: payload.wordLines, wordRate: payload.wordRate, charRate: payload.charRate,
         lines: payload.lines, ts: payload.ts, ttl: payload.ttl,
     };
-    cacheSave(cachePath, cache);
+    cacheSave(cachePath, cacheTrim(cache, 150));
     out(outPath, payload);
 })();
