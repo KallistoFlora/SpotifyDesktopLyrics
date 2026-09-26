@@ -37,26 +37,118 @@ Windows 上的 **Spotify 桌面歌词悬浮层**。三行显示（原文 / 中�
 - **无窗口启动**：`start-lyrics.vbs` 静默后台运行，托盘图标控制
 - 不干扰 Spotify：只**读取**系统媒体会话、只在你要的时候**发送播放控制**，不改客户端、不注入、不需要登录
 
-## 环境要求
+## 与同类工具的差异
 
-| 项目 | 要求 |
+同类东西大致三种：**播放器自带的桌面歌词**（网易云 / QQ音乐 / 酷狗）——功能最全，但只能配自家播放器，你用 Spotify 就没有；
+**Spotify 官方歌词**——需要 Premium，而且没有独立的悬浮层和逐字 KTV；
+**第三方悬浮歌词工具**（例如 [Lyricify](https://docs.lyricify.app/)，其中 Lyricify Lite 同样基于 SMTC，支持多款播放器）。
+
+### 我们刻意做得不一样的地方
+
+| | 本项目 | 常见同类工具 |
+|---|---|---|
+| **账号** | **完全不登录**。走 Windows 系统媒体会话（SMTC）读曲目 / 进度 / 状态，控制也用会话自带接口 | Spotify 系的第三方工具通常要跟 Spotify 做授权，非 Premium 用户还需自建 API Client |
+| **安装** | 两个核心文件（`.ps1` + `.js`）、不到 1 MB，用系统自带的 PowerShell 5.1 + WPF。**不装运行时、不写注册表、不装服务**，解压双击即用，删目录即卸载 | 通常是打包安装的 .NET / Electron 应用 |
+| **取词判定** | 多源并行 + 失败级联，并且有**标题硬门槛**：标题不像就整条否决，宁可显示「未找到歌词」，也不拿别的歌的歌词来凑 | 多以「能搜到就用」为主 |
+| **逐字 KTV** | 按字符进度推进，且**词间空隙停在最后一个唱完的词**（不会瞬间填满）；逐字源有两个（网易云 `yrc`、酷狗 `KRC` 解密） | 行级线性推进居多 |
+| **时钟模型** | Stopwatch 逐帧累加 + 25% 误差吸收 + **换歌滞后补偿** + 换歌后 1.5 秒硬对齐窗口 | 多数直接读播放器上报的位置，换歌后常慢一两秒 |
+| **播放控制** | 直接调 SMTC 会话接口，**不模拟媒体按键**，不影响前台窗口、不需要 Spotify 有焦点 | 部分工具靠模拟键盘媒体键 |
+| **可改** | MIT 许可，核心逻辑就是两个文件，配色 / 字号 / 取词策略都能自己动 | 多数闭源 |
+
+### 我们不占优的地方（也说清楚）
+
+- **只支持 Spotify**：会话过滤写死的是 `*Spotify*`。Lyricify Lite 支持任何集成了 SMTC 的播放器（Apple Music / QQ / 网易云 / 酷狗 / PotPlayer）
+- **没有社区歌词库**：没有账号体系、没有歌词上传与修正，完全依赖第三方公开接口 —— 所以**国内平台没有的曲目就是没有**。这是数据源边界，不是能修掉的 bug
+- **没有主界面**：没有灵动岛、任务栏歌词、多语言、自动更新、安装包签名；形态就一个悬浮层 + 托盘菜单
+- **不轻在内存**：约 190 MB（PowerShell + WPF 的底噪），播放时约占单核个位数百分比。**轻的是安装体积，不是内存和 CPU**
+
+## 安装与部署
+
+**不需要安装。** 这是一个绿色的单目录程序：解压 → 双击 → 完事。
+
+### 前置条件
+
+| 项目 | 要求 | 说明 |
+|---|---|---|
+| 系统 | Windows 10 / 11 | 依赖 WPF 与 Windows 媒体会话（SMTC） |
+| Spotify | **桌面客户端** | 网页版不行；**不需要 Premium** |
+| PowerShell | Windows PowerShell 5.1 | **系统自带，无需安装**。启动器已经指定用它，别改成别的宿主 |
+| Node.js | **18 或更高** | 唯一的额外依赖——歌词抓取器是 node 脚本 |
+
+检查 Node：
+
+```bat
+node -v
+```
+
+没有的话去 <https://nodejs.org> 下 **LTS** 版，一路下一步装完，**重新开一个终端**再 `node -v` 确认。
+程序也会自动去 `%ProgramFiles%\nodejs\node.exe`、`%ProgramFiles(x86)%\nodejs\node.exe`、`%LOCALAPPDATA%\Programs\nodejs\node.exe` 找，所以装在标准位置即使没进 PATH 也能用。
+
+### 安装
+
+#### 方式一：下载 ZIP（不需要 Git）
+
+1. 打开仓库主页 → 绿色 **Code** 按钮 → **Download ZIP**
+2. 解压到**一个固定位置**，例如 `%LOCALAPPDATA%\SpotifyDesktopLyrics`
+3. 双击 **`run-lyrics-overlay.cmd`**（带控制台窗口，出错能直接看见）
+4. 用 Spotify 放一首歌 → 屏幕底部中央应出现歌词
+5. 确认正常后，日常改用 **`start-lyrics.vbs`**（无控制台，静默后台运行）
+
+#### 方式二：git clone
+
+```bat
+git clone https://github.com/KallistoFlora/SpotifyDesktopLyrics.git
+```
+
+> **放哪儿合适？** 建议 `%LOCALAPPDATA%` 或非同步盘的分区。**别放进 OneDrive / 坚果云之类的同步目录**——运行时生成的缓存和日志会被反复同步，还可能被云盘锁住文件。路径里也尽量别出现 `&` `^` 这类 cmd 特殊字符。
+>
+> 两个启动器都用 `-ExecutionPolicy Bypass` 调用 PowerShell，所以**系统执行策略是 Restricted 也能跑**，不需要你去改执行策略。
+
+### 开机自启
+
+在 PowerShell 里粘这一段，会在启动目录建一个快捷方式（把 `$src` 换成你的实际路径）：
+
+```powershell
+$src = "$env:LOCALAPPDATA\SpotifyDesktopLyrics\start-lyrics.vbs"
+$lnk = "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup\Spotify桌面歌词.lnk"
+$ws  = New-Object -ComObject WScript.Shell
+$s   = $ws.CreateShortcut($lnk)
+$s.TargetPath = $src
+$s.WorkingDirectory = (Split-Path $src)
+$s.Save()
+```
+
+取消自启：把启动目录里那个 `.lnk` 删掉即可。
+
+### 目录里都是什么
+
+| 文件 | 作用 |
 |---|---|
-| 系统 | Windows 10 / 11 |
-| PowerShell | Windows PowerShell 5.1（系统自带） |
-| Node.js | 18 或更高（用于抓取歌词） |
+| `lyrics-overlay.ps1` | 主程序：界面、KTV 填充、菜单、播放控制 |
+| `lyrics-fetch.js` | 歌词抓取器：LRCLIB / 网易云 / 酷狗 / QQ + 缓存 |
+| `start-lyrics.vbs` | 静默启动器（日常用这个） |
+| `run-lyrics-overlay.cmd` | 带控制台的启动器（排查问题用） |
+| `lyrics-overlay.example.json` | 配置模板 |
+| `tray.ico` | 托盘图标 |
 
-> 用 `node -v` 可以检查；没有的话去 https://nodejs.org 装一个 LTS 版即可。
+**运行时才会生成**（都在同一目录，删掉不影响程序本身，只会丢设置和缓存）：
 
-## 快速开始
+| 文件 | 内容 |
+|---|---|
+| `lyrics-overlay.json` | 你的设置（位置、颜色、字号…）→ 删掉即恢复默认 |
+| `lyrics-cache.json` | 歌词缓存。**含你的听歌记录**，介意就直接删 |
+| `lyrics-overlay.log` | 运行日志 |
+| `_lyr_req.json` / `_lyr_out.json` | 抓取器的临时输入输出（每次抓取都会重写） |
 
-1. 把整个文件夹放到任意位置（路径里最好别有奇怪符号）
-2. **双击 `run-lyrics-overlay.cmd`** —— 带控制台窗口，方便看到报错
-3. 用 Spotify 放一首歌 → 屏幕底部中央出现歌词
-4. 确认正常后，日常改用 **`start-lyrics.vbs`**（无控制台窗口，后台运行）
-5. 退出：托盘图标右键 → 退出（也可右键歌词本体）
+> 抓取器只往磁盘写**歌名 / 歌手 / 专辑 / 时长**这几个字段和一个本地缓存，**不写任何账号信息**，因为程序根本拿不到也不需要。
 
-> 想开机自启：把 `start-lyrics.vbs` 的快捷方式丢进
-> `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup`
+### 卸载
+
+1. 托盘图标右键 → **退出**
+2. 删掉开机自启的快捷方式（如果建过）
+3. 删掉整个目录
+
+没有注册表项、没有系统服务、没有计划任务——删目录就是干净卸载。
 
 ## 操作方式
 
@@ -169,6 +261,21 @@ KTV 填充：双层 TextBlock，上层用 RectangleGeometry 裁剪出已唱部�
 - **个别歌的逐字时间轴会有系统性偏移**（快或慢半拍左右）：这是数据源自己的时间戳与 Spotify 音频的差异，用「歌词校准」里的**微调 0.05 秒**档对齐即可
 - **超长句换行时**，KTV 填充是一道垂直切面跨过两行（不是逐行推进）
 - 只支持 **Spotify 桌面客户端**（依赖它向 Windows 媒体会话暴露信息）；网页版不支持
+
+## 常见问题
+
+| 症状 | 原因 / 处理 |
+|---|---|
+| 歌词位置显示 **「缺少 node 或 lyrics-fetch.js」** | 没装 Node.js，或者 `lyrics-fetch.js` 被删 / 被杀软隔离。装好 LTS 版 Node 后重启程序；日志里会写 `fetch impossible: node='…'` |
+| 一直显示 **「未找到歌词」** | 数据源确实没有这首歌（见上方「已知限制」）。先试右键 → **重新获取歌词（忽略缓存）**；下架曲目、冷门版本、纯音乐通常就是没有 |
+| 显示 **「歌词获取失败」** | 抓取器报错或超时（多为数据源限流）。换一首或稍后再点「重新获取歌词」，细节看 `lyrics-overlay.log` |
+| 双击 `start-lyrics.vbs` 没反应 | 很可能**已经在运行了**（单实例）。看托盘图标——若确实在跑，还会弹出「桌面歌词已经在运行了」的提示框 |
+| 找不到托盘图标 | 展开托盘溢出区（小三角）。程序**不会**出现在任务栏和 Alt-Tab 里，这是设计如此（`WS_EX_TOOLWINDOW`） |
+| 歌词点不动 / 完全不响应鼠标 | 这是**锁定（鼠标穿透）**状态，日常就该这样。改设置走**托盘图标右键** |
+| 歌词比声音快 / 慢半拍 | 右键 → **歌词校准**：0.2 秒档粗调，0.05 秒档微调 |
+| 杀软报毒 / 提示脚本风险 | `.vbs` + `powershell -ExecutionPolicy Bypass` 是常见的启发式误报特征（启动器需要它才能在默认执行策略下运行，见上方说明）。介意的话直接用 `run-lyrics-overlay.cmd`，或者自己审一遍这两个启动器——加起来只有十几行 |
+| 换歌后头一两秒歌词偏 | 已做滞后补偿；个别歌仍偏就用「歌词校准」 |
+| 想彻底重来 | 退出程序 → 删掉 `lyrics-overlay.json` 和 `lyrics-cache.json` → 重新启动 |
 
 ## 免责声明
 
